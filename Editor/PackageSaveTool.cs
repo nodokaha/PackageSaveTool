@@ -146,6 +146,59 @@ public class FolderSelectionTreeView : TreeView
         }
     }
 
+    /// <summary>
+    /// チェックボックスの見た目上の状態（未チェック／チェック済み／一部だけチェック＝中間状態）
+    /// </summary>
+    private enum CheckState
+    {
+        Unchecked,
+        Checked,
+        Mixed
+    }
+
+    /// <summary>
+    /// アイテム自身とその子孫全体を見て、表示すべきチェック状態を算出する。
+    /// フォルダの子孫の一部だけがチェックされている場合はMixed（中間状態）を返す。
+    /// これは表示専用のロジックであり、item.isChecked 自体は変更しない
+    /// （選択されたパスの実体は、明示的にチェックされた項目のみ）。
+    /// </summary>
+    private CheckState GetCheckState(FolderTreeItem item)
+    {
+        if (!item.hasChildren || item.children == null || item.children.Count == 0)
+        {
+            return item.isChecked ? CheckState.Checked : CheckState.Unchecked;
+        }
+
+        bool anyChecked = item.isChecked;
+        bool anyUnchecked = !item.isChecked;
+
+        foreach (TreeViewItem child in item.children)
+        {
+            if (child is FolderTreeItem folderChild)
+            {
+                var childState = GetCheckState(folderChild);
+                if (childState == CheckState.Mixed)
+                {
+                    anyChecked = true;
+                    anyUnchecked = true;
+                }
+                else if (childState == CheckState.Checked)
+                {
+                    anyChecked = true;
+                }
+                else
+                {
+                    anyUnchecked = true;
+                }
+            }
+        }
+
+        if (anyChecked && anyUnchecked)
+            return CheckState.Mixed;
+
+        return anyChecked ? CheckState.Checked : CheckState.Unchecked;
+    }
+
     protected override void RowGUI(RowGUIArgs args)
     {
         var item = args.item as FolderTreeItem;
@@ -158,9 +211,18 @@ public class FolderSelectionTreeView : TreeView
         float indent = GetContentIndent(item);
         Rect rowRect = args.rowRect;
         Rect toggleRect = new Rect(rowRect.x + indent + 4, rowRect.y + 2, 16, rowRect.height - 4);
-        bool newValue = EditorGUI.Toggle(toggleRect, item.isChecked);
-        if (newValue != item.isChecked)
+
+        CheckState state = GetCheckState(item);
+        bool displayValue = state == CheckState.Checked;
+
+        bool previousMixedValue = EditorGUI.showMixedValue;
+        EditorGUI.showMixedValue = (state == CheckState.Mixed);
+        bool newValue = EditorGUI.Toggle(toggleRect, displayValue);
+        EditorGUI.showMixedValue = previousMixedValue;
+
+        if (newValue != displayValue)
         {
+            // 中間状態からクリックした場合は「全選択」、チェック済みからは「全解除」になる
             SetCheckedRecursively(item, newValue);
             Repaint();
         }
@@ -288,6 +350,18 @@ public class PackageSaveTool : EditorWindow
 {
     private const string AuthorEditorPrefKey = "PackageSaveTool_AuthorName";
 
+    // 選択した相対パス（Assets基準）を記録するマニフェストのファイル名
+    private const string ManifestFileName = "_selection_manifest.json";
+
+    /// <summary>
+    /// Save時に選択された、Assetsからの相対パスの一覧を保持するマニフェスト
+    /// </summary>
+    [System.Serializable]
+    private class SelectionManifest
+    {
+        public string[] relativePaths;
+    }
+
     private Vector2 scrollPosition;
     private VersionInfo currentVersion = new VersionInfo(1, 0, 0);
     private string authorName = "Unknown";
@@ -354,7 +428,7 @@ public class PackageSaveTool : EditorWindow
         }
 
         EditorGUILayout.Space();
-        EditorGUILayout.HelpBox("Save: Saves a folder with automatic versioning if changes detected.\n\nLoad: Imports folder and restores VRC/Animation component references.\n\nCopy Components: Copies components from a selected prefab to a selected FBX model.", MessageType.Info);
+        EditorGUILayout.HelpBox("Save: Saves selected folders/files while preserving their Assets-relative hierarchy, and records a manifest of what was selected.\n\nLoad: If a manifest is present, updates only the folders/files listed in it (relative to Assets), leaving everything else untouched. Falls back to legacy full-folder import for packages without a manifest.\n\nCopy Components: Copies components from a selected prefab to a selected FBX model.", MessageType.Info);
 
         GUILayout.EndScrollView();
     }
@@ -438,6 +512,44 @@ public class PackageSaveTool : EditorWindow
     }
 
     /// <summary>
+    /// フルパス（"Assets/Foo/Bar/Baz" 等、ツリービューが返す "Assets" 起点の相対パス）から、
+    /// "Assets/" を除いた相対パス（"Foo/Bar/Baz"）を取得する。
+    /// これを保存先直下に適用することで、Assets内の階層構造を保ったままコピーできる。
+    /// </summary>
+    private string GetPathRelativeToAssets(string fullPath)
+    {
+        string normalized = fullPath.Replace('\\', '/').TrimEnd('/');
+
+        // FilterTopLevelSelections が Path.GetFullPath() で絶対パス化することがあるため、
+        // まず Application.dataPath（Assetsフォルダの絶対パス）を基準に判定する。
+        string assetsAbsolute = Application.dataPath.Replace('\\', '/').TrimEnd('/');
+        if (normalized.StartsWith(assetsAbsolute + "/", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized.Substring(assetsAbsolute.Length + 1);
+        }
+
+        if (normalized.Equals(assetsAbsolute, System.StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        // ツリービューから渡される "Assets/..." 形式の相対パスにも対応
+        const string prefix = "Assets/";
+        if (normalized.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized.Substring(prefix.Length);
+        }
+
+        if (normalized.Equals("Assets", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        // 想定外の形式の場合はファイル名のみにフォールバック（従来動作）
+        return Path.GetFileName(normalized);
+    }
+
+    /// <summary>
     /// フォルダを保存し、差分があればバージョン番号を付加する
     /// </summary>
     /// <summary>
@@ -465,23 +577,44 @@ public class PackageSaveTool : EditorWindow
         string savePath = Path.Combine(destinationPath, saveFolder);
         Directory.CreateDirectory(savePath);
 
-        // 選択されたパスをコピー
+        // 選択されたパスを、Assetsからの相対パスを維持したままコピーする。
+        // これにより、深い階層のフォルダ/ファイルだけを選択しても、
+        // 親フォルダの中身を巻き込まずに、正しい階層構造で保存できる。
+        var manifestRelativePaths = new List<string>();
+
         foreach (var selectedPath in selectedPaths)
         {
-            string fileName = Path.GetFileName(selectedPath);
-            string destPath = Path.Combine(savePath, fileName);
+            string relativePath = GetPathRelativeToAssets(selectedPath);
+            if (string.IsNullOrEmpty(relativePath))
+                continue;
+
+            string destPath = Path.Combine(savePath, relativePath.Replace('/', Path.DirectorySeparatorChar));
 
             if (File.Exists(selectedPath))
             {
-                // ファイルをコピー
+                string destDir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(destDir))
+                    Directory.CreateDirectory(destDir);
+
                 File.Copy(selectedPath, destPath, true);
+                manifestRelativePaths.Add(relativePath);
             }
             else if (Directory.Exists(selectedPath))
             {
-                // フォルダをコピー
+                string destParentDir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(destParentDir))
+                    Directory.CreateDirectory(destParentDir);
+
                 CopyFolder(selectedPath, destPath);
+                manifestRelativePaths.Add(relativePath);
             }
         }
+
+        // 選択内容（Assets相対パス）をマニフェストとして保存。
+        // Load時にこのマニフェストを見て、対象パスだけを更新できるようにする。
+        var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.ToArray() };
+        string manifestPath = Path.Combine(savePath, ManifestFileName);
+        File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true));
 
         Debug.Log($"Folders saved successfully to: {savePath}");
         Debug.Log($"Current Version: {currentVersion}");
@@ -549,7 +682,7 @@ public class PackageSaveTool : EditorWindow
     /// </summary>
     private VersionInfo ExtractVersionFromFolderName(string folderPath)
     {
-        string folderName = Path.GetFileName(folderPath);
+        string folderName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         var match = Regex.Match(folderName, @"[_=]([vV]?\d+\.\d+\.\d+)$");
         
         if (match.Success)
@@ -628,7 +761,11 @@ public class PackageSaveTool : EditorWindow
     }
 
     /// <summary>
-    /// フォルダをロードして、参照を修復する
+    /// フォルダをロードして、参照を修復する。
+    /// 保存時に書き出したマニフェストが存在する場合は、そこに記録された
+    /// Assets相対パスだけをピンポイントで更新する（他のフォルダには触れない）。
+    /// マニフェストが無い（旧形式で保存された）パッケージは、従来通り
+    /// フォルダ全体をユーザー指定の場所へインポートする。
     /// </summary>
     private void LoadFolderWithReferenceFixing()
     {
@@ -639,6 +776,15 @@ public class PackageSaveTool : EditorWindow
             Debug.Log("Load cancelled.");
             return;
         }
+
+        string manifestPath = Path.Combine(folderPath, ManifestFileName);
+        if (File.Exists(manifestPath))
+        {
+            LoadUsingManifest(folderPath, manifestPath);
+            return;
+        }
+
+        // --- 以下、マニフェストが無い旧形式パッケージ向けの従来ロジック ---
 
         string assetsFolderPath = Path.Combine(EditorApplication.applicationPath, "..", "Assets").Replace("\\", "/");
         string projectFolder = Directory.GetParent(Application.dataPath).FullName;
@@ -697,6 +843,132 @@ public class PackageSaveTool : EditorWindow
         Debug.Log($"Folder imported and references fixed at: {relativeImportPath}");
         Debug.Log($"Loaded with Version: {currentVersion}");
         EditorUtility.RevealInFinder(finalImportPath);
+    }
+
+    /// <summary>
+    /// マニフェストに記録された相対パスだけを、Assets内の対応する場所にピンポイントで更新する。
+    /// 各パスごとに差分を確認し、必要であれば確認ダイアログを出す。
+    /// 対象外のフォルダ/ファイルには一切触れない。
+    /// </summary>
+    private void LoadUsingManifest(string sourceRoot, string manifestPath)
+    {
+        string json = File.ReadAllText(manifestPath);
+        SelectionManifest manifest = null;
+        try
+        {
+            manifest = JsonUtility.FromJson<SelectionManifest>(json);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"Failed to parse manifest: {e.Message}");
+            return;
+        }
+
+        if (manifest == null || manifest.relativePaths == null || manifest.relativePaths.Length == 0)
+        {
+            Debug.LogWarning("Manifest is empty or invalid. Nothing to update.");
+            return;
+        }
+
+        string projectAssetsPath = Application.dataPath; // ".../Assets" の絶対パス
+        string projectFolder = Directory.GetParent(projectAssetsPath).FullName;
+
+        var updatedRelativePaths = new List<string>();
+
+        foreach (var relPath in manifest.relativePaths)
+        {
+            if (string.IsNullOrEmpty(relPath))
+                continue;
+
+            string normalizedRel = relPath.Replace('/', Path.DirectorySeparatorChar);
+            string sourcePath = Path.Combine(sourceRoot, normalizedRel);
+            string destPath = Path.Combine(projectAssetsPath, normalizedRel);
+
+            if (File.Exists(sourcePath))
+            {
+                bool existed = File.Exists(destPath);
+                if (existed && !FileHashEquals(sourcePath, destPath))
+                {
+                    bool proceed = EditorUtility.DisplayDialog(
+                        "Overwrite Confirmation",
+                        $"更新対象: Assets/{relPath.Replace('\\', '/')}\n" +
+                        "既存のファイルと内容が異なります。上書きしますか？",
+                        "上書きする", "スキップ");
+
+                    if (!proceed)
+                        continue;
+                }
+
+                string destDir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(destDir))
+                    Directory.CreateDirectory(destDir);
+
+                File.Copy(sourcePath, destPath, true);
+                updatedRelativePaths.Add(relPath);
+            }
+            else if (Directory.Exists(sourcePath))
+            {
+                bool existed = Directory.Exists(destPath);
+                if (existed)
+                {
+                    var diffInfo = GetFolderDifferences(sourcePath, destPath);
+                    if (diffInfo.Added.Count > 0 || diffInfo.Modified.Count > 0 || diffInfo.Removed.Count > 0)
+                    {
+                        var summary = new StringBuilder();
+                        summary.AppendLine($"更新対象: Assets/{relPath.Replace('\\', '/')}");
+                        summary.AppendLine($"追加: {diffInfo.Added.Count} 件");
+                        summary.AppendLine($"変更: {diffInfo.Modified.Count} 件");
+                        summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
+                        summary.AppendLine();
+                        summary.AppendLine("このフォルダだけが更新されます（他のフォルダは変更されません）。よろしいですか？");
+
+                        Debug.Log($"[PackageSaveTool] Diff for Assets/{relPath.Replace('\\', '/')}:\n" + string.Join("\n", diffInfo.GetAllLines()));
+
+                        if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), "上書きする", "スキップ"))
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                CopyFolder(sourcePath, destPath);
+                updatedRelativePaths.Add(relPath);
+            }
+            else
+            {
+                Debug.LogWarning($"Source path listed in manifest was not found in package: {relPath}");
+            }
+        }
+
+        // 保存フォルダ名（例: Author_v1.0.0）からバージョンを検出・更新
+        VersionInfo loadedVersion = ExtractVersionFromFolderName(sourceRoot);
+        if (loadedVersion != null)
+        {
+            UpdateVersionAfterLoad(loadedVersion);
+        }
+
+        if (updatedRelativePaths.Count == 0)
+        {
+            Debug.Log("No folders/files were updated.");
+            return;
+        }
+
+        // アセットデータベースをリフレッシュ
+        AssetDatabase.Refresh();
+
+        // 更新した各パスについて参照を修復
+        foreach (var relPath in updatedRelativePaths)
+        {
+            string relativeAssetPath = ("Assets/" + relPath).Replace('\\', '/');
+            FixComponentReferences(relativeAssetPath);
+        }
+
+        Debug.Log($"Updated {updatedRelativePaths.Count} folder(s)/file(s) using manifest: " +
+            string.Join(", ", updatedRelativePaths.Select(p => "Assets/" + p.Replace('\\', '/'))));
+        Debug.Log($"Loaded with Version: {currentVersion}");
+
+        string firstUpdatedDest = Path.Combine(projectAssetsPath, updatedRelativePaths[0].Replace('/', Path.DirectorySeparatorChar));
+        EditorUtility.RevealInFinder(firstUpdatedDest);
     }
 
     private class FolderDiffInfo
