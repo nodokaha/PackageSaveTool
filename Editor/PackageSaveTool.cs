@@ -90,17 +90,7 @@ namespace PackageSaveTool
 
             if (GUILayout.Button("Load Folder (Import & Fix References)", GUILayout.Height(40)))
             {
-                // 1. ファイルの読み込みと配置
                 LoadFolderWithReferenceFixing();
-
-                // 2. アセットデータベースの強制更新
-                AssetDatabase.Refresh();
-
-                // 3. 参照補完・アニメーションコントローラーのMissing修復
-                FixAllAnimatorControllers();
-
-                // 4. 完了通知
-                EditorUtility.DisplayDialog("Complete", "フォルダの読み込みと参照の自動補完が完了しました。", "OK");
             }
 
             EditorGUILayout.Space();
@@ -129,9 +119,9 @@ namespace PackageSaveTool
             EditorGUILayout.Space();
             EditorGUILayout.HelpBox(
                 "Save: 選択された項目とDependencies(依存関係)を一括保存します。\n\n" +
-                "Load: Manifestファイルを元に相対パスで正確に復元読み込みを行います。\n\n" +
+                "Load: Manifestファイルを元に相対パスで正確に復元読み込みを行います。差分を表示し、ユーザー承認後にのみ読み込みます。\n\n" +
                 "Copy Components: Prefabのコンポーネント設定をFBXモデル階層に転写し、新たなPrefabを出力します。\n\n" +
-                "Scan / Fix: AnimatorController内のMissingアニメーションクリップを検出・補完します。",
+                "Scan / Fix: AnimatorController内のMissingアニメーションクリップを検出・補完します。Load後はスキャンのみ行い、修復前に確認します。",
                 MessageType.Info);
 
             GUILayout.EndScrollView();
@@ -366,8 +356,8 @@ namespace PackageSaveTool
             string sourceFolder = GetImportSourceFolder(folderPath);
             string finalImportPath = Path.Combine(importPath, new DirectoryInfo(sourceFolder).Name);
 
-            // 既存フォルダが存在し、かつ差分が存在する場合に専用GUIウィンドウを表示
-            if (Directory.Exists(finalImportPath) && FolderHasChanges(sourceFolder, finalImportPath))
+            // 差分が存在する場合に専用GUIウィンドウを表示し、承認後にのみ読み込みを実行
+            if (FolderHasChanges(sourceFolder, finalImportPath))
             {
                 // 詳細な差分情報（パラメータ差分含む）を取得
                 DetailedFolderDiffInfo diffInfo = GetDetailedFolderDifferences(sourceFolder, finalImportPath);
@@ -400,6 +390,7 @@ namespace PackageSaveTool
 
             AssetDatabase.Refresh();
             Debug.Log($"[PackageSaveTool] 読み込みが完了しました: {finalImportPath}");
+            CompleteLoadAndAskAnimatorFix();
         }
 
         private void LoadUsingManifest(string sourceRoot, string manifestPath)
@@ -486,6 +477,36 @@ namespace PackageSaveTool
 
             AssetDatabase.Refresh();
             Debug.Log("[PackageSaveTool] Load completed using selection_manifest scope.");
+            CompleteLoadAndAskAnimatorFix();
+        }
+
+        /// <summary>
+        /// Load後はAnimatorControllerをスキャンするだけに留め、修復実行前にユーザー承認を求める。
+        /// </summary>
+        private void CompleteLoadAndAskAnimatorFix()
+        {
+            var reports = ScanAllAnimatorControllers();
+            int missingCount = reports.Count;
+
+            if (missingCount == 0)
+            {
+                EditorUtility.DisplayDialog(
+                    "Complete",
+                    "フォルダの読み込みが完了しました。\nAnimationClip の Missing は見つかりませんでした。",
+                    "OK");
+                return;
+            }
+
+            bool shouldFix = EditorUtility.DisplayDialog(
+                "Animation Clips Missing",
+                $"フォルダの読み込みが完了しました。\n\nAnimatorController 内に Missing AnimationClip が {missingCount} 件見つかりました。\n結果ウィンドウを確認できます。\n\n修復を実行しますか？",
+                "修復する",
+                "スキャンのみで終了");
+
+            if (shouldFix)
+            {
+                FixAllAnimatorControllers();
+            }
         }
 
         /// <summary>
@@ -769,7 +790,7 @@ namespace PackageSaveTool
         #endregion
 
         #region Animator修復呼び出し
-        private void ScanAllAnimatorControllers()
+        private List<AnimatorFixReport> ScanAllAnimatorControllers()
         {
             AssetDatabase.Refresh();
             string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
@@ -787,6 +808,7 @@ namespace PackageSaveTool
             }
 
             AnimatorFixResultWindow.ShowReport(allReports, "Animator Missing Scan Results");
+            return allReports;
         }
 
         private void FixAllAnimatorControllers()
