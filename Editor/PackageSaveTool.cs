@@ -349,6 +349,7 @@ public class FolderSelectionWindow : EditorWindow
 public class PackageSaveTool : EditorWindow
 {
     private const string AuthorEditorPrefKey = "PackageSaveTool_AuthorName";
+    private const string IntegrationModeEditorPrefKey = "PackageSaveTool_IntegrationMode";
 
     // 選択した相対パス（Assets基準）を記録するマニフェストのファイル名
     private const string ManifestFileName = "_selection_manifest.json";
@@ -365,6 +366,10 @@ public class PackageSaveTool : EditorWindow
     private Vector2 scrollPosition;
     private VersionInfo currentVersion = new VersionInfo(1, 0, 0);
     private string authorName = "Unknown";
+
+    // 統合モード: ONの場合、Save/Loadでフォルダを更新する際に既存フォルダを削除せず、
+    // ファイルの追加・上書きのみ行う（マージ）。送信元に無い既存ファイルはそのまま残る。
+    private bool integrationMode = false;
 
     [MenuItem("Tools/Package Save Tool")]
     public static void ShowWindow()
@@ -394,6 +399,17 @@ public class PackageSaveTool : EditorWindow
             if (string.IsNullOrEmpty(authorName))
                 authorName = "Unknown";
             EditorPrefs.SetString(AuthorEditorPrefKey, authorName);
+        }
+
+        EditorGUILayout.Space();
+
+        EditorGUI.BeginChangeCheck();
+        integrationMode = EditorGUILayout.ToggleLeft(
+            "統合モード（マージ：既存フォルダを削除せず、追加・上書きのみ行う）",
+            integrationMode);
+        if (EditorGUI.EndChangeCheck())
+        {
+            EditorPrefs.SetBool(IntegrationModeEditorPrefKey, integrationMode);
         }
 
         EditorGUILayout.Space();
@@ -428,7 +444,7 @@ public class PackageSaveTool : EditorWindow
         }
 
         EditorGUILayout.Space();
-        EditorGUILayout.HelpBox("Save: Saves selected folders/files while preserving their Assets-relative hierarchy, and records a manifest of what was selected.\n\nLoad: If a manifest is present, updates only the folders/files listed in it (relative to Assets), leaving everything else untouched. Falls back to legacy full-folder import for packages without a manifest.\n\nCopy Components: Copies components from a selected prefab to a selected FBX model.", MessageType.Info);
+        EditorGUILayout.HelpBox("Save: Saves selected folders/files while preserving their Assets-relative hierarchy, and records a manifest of what was selected.\n\nLoad: If a manifest is present, updates only the folders/files listed in it (relative to Assets), leaving everything else untouched. Falls back to legacy full-folder import for packages without a manifest.\n\n統合モード: ONにすると、Save/Loadでフォルダを上書きする際に既存フォルダを削除せず、ファイルの追加・上書きのみ行います（マージ）。送信元に存在しない既存ファイルはそのまま残ります。OFFの場合は従来通り、対象フォルダを一度削除してから書き込みます。\n\nCopy Components: Copies components from a selected prefab to a selected FBX model.", MessageType.Info);
 
         GUILayout.EndScrollView();
     }
@@ -497,6 +513,7 @@ public class PackageSaveTool : EditorWindow
         authorName = EditorPrefs.GetString(AuthorEditorPrefKey, "Unknown");
         if (string.IsNullOrWhiteSpace(authorName))
             authorName = "Unknown";
+        integrationMode = EditorPrefs.GetBool(IntegrationModeEditorPrefKey, false);
     }
 
     private string SanitizeFileName(string fileName)
@@ -809,13 +826,24 @@ public class PackageSaveTool : EditorWindow
             summary.AppendLine($"既存フォルダが見つかりました: {finalImportPath}");
             summary.AppendLine($"追加: {diffInfo.Added.Count} 件");
             summary.AppendLine($"変更: {diffInfo.Modified.Count} 件");
-            summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
-            summary.AppendLine();
-            summary.AppendLine("この操作で現在のデータは上書きされます。バックアップは大丈夫ですか？");
+
+            if (integrationMode)
+            {
+                summary.AppendLine("統合モードが有効なため、既存ファイルの削除は行われません（マージ）。");
+                summary.AppendLine();
+                summary.AppendLine("この操作で新しい内容が既存データに統合されます。よろしいですか？");
+            }
+            else
+            {
+                summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
+                summary.AppendLine();
+                summary.AppendLine("この操作で現在のデータは上書きされます。バックアップは大丈夫ですか？");
+            }
 
             Debug.Log("[PackageSaveTool] Folder diff details:\n" + string.Join("\n", diffInfo.GetAllLines()));
 
-            if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), "上書きする", "キャンセル"))
+            string confirmLabel = integrationMode ? "統合する" : "上書きする";
+            if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), confirmLabel, "キャンセル"))
             {
                 Debug.Log("Import cancelled by user.");
                 return;
@@ -912,19 +940,34 @@ public class PackageSaveTool : EditorWindow
                 if (existed)
                 {
                     var diffInfo = GetFolderDifferences(sourcePath, destPath);
-                    if (diffInfo.Added.Count > 0 || diffInfo.Modified.Count > 0 || diffInfo.Removed.Count > 0)
+                    bool hasRelevantChanges = diffInfo.Added.Count > 0 || diffInfo.Modified.Count > 0 ||
+                        (!integrationMode && diffInfo.Removed.Count > 0);
+
+                    if (hasRelevantChanges)
                     {
                         var summary = new StringBuilder();
                         summary.AppendLine($"更新対象: Assets/{relPath.Replace('\\', '/')}");
                         summary.AppendLine($"追加: {diffInfo.Added.Count} 件");
                         summary.AppendLine($"変更: {diffInfo.Modified.Count} 件");
-                        summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
+
+                        if (integrationMode)
+                        {
+                            summary.AppendLine("統合モードが有効なため、既存ファイルの削除は行われません（マージ）。");
+                        }
+                        else
+                        {
+                            summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
+                        }
+
                         summary.AppendLine();
-                        summary.AppendLine("このフォルダだけが更新されます（他のフォルダは変更されません）。よろしいですか？");
+                        summary.AppendLine(integrationMode
+                            ? "このフォルダに新しい内容を統合（マージ）します。既存データは削除されません。よろしいですか？"
+                            : "このフォルダだけが更新されます（他のフォルダは変更されません）。よろしいですか？");
 
                         Debug.Log($"[PackageSaveTool] Diff for Assets/{relPath.Replace('\\', '/')}:\n" + string.Join("\n", diffInfo.GetAllLines()));
 
-                        if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), "上書きする", "スキップ"))
+                        string confirmLabel = integrationMode ? "統合する" : "上書きする";
+                        if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), confirmLabel, "スキップ"))
                         {
                             continue;
                         }
@@ -1087,12 +1130,22 @@ public class PackageSaveTool : EditorWindow
     }
 
     /// <summary>
-    /// フォルダをコピー
+    /// フォルダをコピーする（統合モード設定に従う）。
+    /// 統合モードがOFFの場合は、従来通りコピー先を一度削除してから上書きする。
+    /// 統合モードがONの場合は、コピー先を削除せず、ファイルの追加・上書きのみ行う（マージ）。
+    /// この場合、送信元に存在しないコピー先側の既存ファイル/フォルダはそのまま残る。
     /// </summary>
     private void CopyFolder(string sourcePath, string destPath)
     {
-        if (Directory.Exists(destPath))
+        CopyFolder(sourcePath, destPath, integrationMode);
+    }
+
+    private void CopyFolder(string sourcePath, string destPath, bool merge)
+    {
+        if (!merge && Directory.Exists(destPath))
+        {
             Directory.Delete(destPath, true);
+        }
 
         Directory.CreateDirectory(destPath);
 
@@ -1105,7 +1158,7 @@ public class PackageSaveTool : EditorWindow
         foreach (var folder in Directory.GetDirectories(sourcePath))
         {
             string folderName = Path.GetFileName(folder);
-            CopyFolder(folder, Path.Combine(destPath, folderName));
+            CopyFolder(folder, Path.Combine(destPath, folderName), merge);
         }
     }
 
