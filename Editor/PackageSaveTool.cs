@@ -2,10 +2,12 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEditor;
+using UnityEditor.Animations;
 using UnityEditor.SceneManagement;
 using UnityEditor.IMGUI.Controls;
 
@@ -88,7 +90,6 @@ public class FolderSelectionTreeView : TreeView
         itemDict.Clear();
         nextId = 1;
 
-        // Assetsフォルダを起点に構築
         string assetsPath = "Assets";
         if (Directory.Exists(assetsPath))
         {
@@ -108,7 +109,6 @@ public class FolderSelectionTreeView : TreeView
             int parentId = nextId;
             nextId++;
 
-            // サブフォルダを追加
             var subDirs = Directory.GetDirectories(folderPath).OrderBy(p => Path.GetFileName(p));
             foreach (var dir in subDirs)
             {
@@ -116,7 +116,6 @@ public class FolderSelectionTreeView : TreeView
                 if (dirName.StartsWith("."))
                     continue;
 
-                // デフォルトでEditorとXRは除外
                 if (dirName.Equals("Editor", System.StringComparison.OrdinalIgnoreCase) ||
                     dirName.Equals("XR", System.StringComparison.OrdinalIgnoreCase))
                 {
@@ -126,7 +125,6 @@ public class FolderSelectionTreeView : TreeView
                 BuildTreeRecursive(dir, item, depth + 1);
             }
 
-            // ファイルを追加
             var files = Directory.GetFiles(folderPath).OrderBy(p => Path.GetFileName(p));
             foreach (var file in files)
             {
@@ -142,13 +140,10 @@ public class FolderSelectionTreeView : TreeView
         }
         catch
         {
-            // アクセス権がない等のエラーは無視
+            // アクセス権エラー等はスキップ
         }
     }
 
-    /// <summary>
-    /// チェックボックスの見た目上の状態（未チェック／チェック済み／一部だけチェック＝中間状態）
-    /// </summary>
     private enum CheckState
     {
         Unchecked,
@@ -156,12 +151,6 @@ public class FolderSelectionTreeView : TreeView
         Mixed
     }
 
-    /// <summary>
-    /// アイテム自身とその子孫全体を見て、表示すべきチェック状態を算出する。
-    /// フォルダの子孫の一部だけがチェックされている場合はMixed（中間状態）を返す。
-    /// これは表示専用のロジックであり、item.isChecked 自体は変更しない
-    /// （選択されたパスの実体は、明示的にチェックされた項目のみ）。
-    /// </summary>
     private CheckState GetCheckState(FolderTreeItem item)
     {
         if (!item.hasChildren || item.children == null || item.children.Count == 0)
@@ -222,7 +211,6 @@ public class FolderSelectionTreeView : TreeView
 
         if (newValue != displayValue)
         {
-            // 中間状態からクリックした場合は「全選択」、チェック済みからは「全解除」になる
             SetCheckedRecursively(item, newValue);
             Repaint();
         }
@@ -278,7 +266,6 @@ public class FolderSelectionWindow : EditorWindow
 {
     private TreeViewState treeViewState;
     private FolderSelectionTreeView treeView;
-    private Vector2 scrollPosition;
     private System.Action<List<string>> onFoldersSelected;
 
     public static void ShowWindow(System.Action<List<string>> callback)
@@ -302,7 +289,6 @@ public class FolderSelectionWindow : EditorWindow
         EditorGUILayout.LabelField("Select folders and files to save", EditorStyles.boldLabel);
         EditorGUILayout.Space();
 
-        // ボタン
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("All", GUILayout.Width(60)))
         {
@@ -317,13 +303,11 @@ public class FolderSelectionWindow : EditorWindow
 
         EditorGUILayout.Space();
 
-        // ツリービュー
         Rect treeRect = GUILayoutUtility.GetRect(0, 300, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
         treeView.OnGUI(treeRect);
 
         EditorGUILayout.Space();
 
-        // 決定ボタン
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("Save Selected", GUILayout.Height(30)))
         {
@@ -346,17 +330,339 @@ public class FolderSelectionWindow : EditorWindow
     }
 }
 
+/// <summary>
+/// 修復・検出ログのデータ構造
+/// </summary>
+public class AnimatorFixReport
+{
+    public string ControllerName;
+    public string ControllerPath;
+    public string StateName;
+    public string ReassignedClipName;
+    public string ClipPath;
+    public bool IsFixed; // true: 修復済み, false: Missing検出のみ
+}
+
+/// <summary>
+/// Missing検出・修復結果リスト表示用ウィンドウ
+/// </summary>
+public class AnimatorFixResultWindow : EditorWindow
+{
+    private List<AnimatorFixReport> reports = new List<AnimatorFixReport>();
+    private Vector2 scrollPos;
+    private string windowTitleText = "Animator Controller Analysis Results";
+
+    public static void ShowReport(List<AnimatorFixReport> reportList, string title = "Animator Results")
+    {
+        var window = GetWindow<AnimatorFixResultWindow>("Animator Results");
+        window.minSize = new Vector2(650, 400);
+        window.reports = reportList ?? new List<AnimatorFixReport>();
+        window.windowTitleText = title;
+        window.Show();
+    }
+
+    private void OnGUI()
+    {
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField($"{windowTitleText} (全 {reports.Count} 件)", EditorStyles.boldLabel);
+        EditorGUILayout.Space();
+
+        if (reports.Count == 0)
+        {
+            EditorGUILayout.HelpBox("該当する AnimationClip の項目は見つかりませんでした。", MessageType.Info);
+            return;
+        }
+
+        // テーブルヘッダー
+        EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+        GUILayout.Label("Status", EditorStyles.boldLabel, GUILayout.Width(70));
+        GUILayout.Label("Animator Controller", EditorStyles.boldLabel, GUILayout.Width(180));
+        GUILayout.Label("State / Target", EditorStyles.boldLabel, GUILayout.Width(150));
+        GUILayout.Label("Clip Info", EditorStyles.boldLabel, GUILayout.Width(180));
+        GUILayout.Label("操作", EditorStyles.boldLabel, GUILayout.Width(60));
+        EditorGUILayout.EndHorizontal();
+
+        scrollPos = EditorGUILayout.BeginScrollView(scrollPos);
+
+        foreach (var r in reports)
+        {
+            EditorGUILayout.BeginHorizontal(GUI.skin.box);
+
+            // ステータス表示
+            if (r.IsFixed)
+            {
+                GUI.color = Color.green;
+                GUILayout.Label("[Fixed]", GUILayout.Width(70));
+                GUI.color = Color.white;
+            }
+            else
+            {
+                GUI.color = Color.red;
+                GUILayout.Label("[Missing]", GUILayout.Width(70));
+                GUI.color = Color.white;
+            }
+
+            // コントローラー名・ステート名・クリップ名
+            GUILayout.Label(r.ControllerName, GUILayout.Width(180));
+            GUILayout.Label(r.StateName, GUILayout.Width(150));
+            GUILayout.Label(string.IsNullOrEmpty(r.ReassignedClipName) ? "None (Missing)" : r.ReassignedClipName, GUILayout.Width(180));
+
+            // Select ボタン（該当アセットにフォーカス）
+            if (GUILayout.Button("Select", EditorStyles.miniButton, GUILayout.Width(50)))
+            {
+                var obj = AssetDatabase.LoadAssetAtPath<Object>(r.ControllerPath);
+                if (obj != null)
+                {
+                    EditorGUIUtility.PingObject(obj);
+                    Selection.activeObject = obj;
+                }
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
+        EditorGUILayout.EndScrollView();
+
+        EditorGUILayout.Space();
+        if (GUILayout.Button("閉じる", GUILayout.Height(30)))
+        {
+            Close();
+        }
+    }
+}
+
+/// <summary>
+/// AnimatorController 内のアニメーション欠落（Missing）の自動検知および修復クラス
+/// </summary>
+public static class AnimatorControllerFixer
+{
+    /// <summary>
+    /// Missingの項目のみをスキップ（検出のみ）
+    /// </summary>
+    public static List<AnimatorFixReport> ScanMissingClips(AnimatorController controller)
+    {
+        var reports = new List<AnimatorFixReport>();
+        if (controller == null) return reports;
+
+        string controllerPath = AssetDatabase.GetAssetPath(controller);
+
+        foreach (var layer in controller.layers)
+        {
+            ScanStateMachine(layer.stateMachine, controller.name, controllerPath, reports);
+        }
+
+        return reports;
+    }
+
+    private static void ScanStateMachine(AnimatorStateMachine stateMachine, string controllerName, string controllerPath, List<AnimatorFixReport> reports)
+    {
+        foreach (var childState in stateMachine.states)
+        {
+            var state = childState.state;
+            if (state == null) continue;
+
+            if (state.motion is BlendTree blendTree)
+            {
+                ScanBlendTree(blendTree, controllerName, controllerPath, reports);
+            }
+            else if (IsMotionMissing(state, out _))
+            {
+                reports.Add(new AnimatorFixReport
+                {
+                    ControllerName = controllerName,
+                    ControllerPath = controllerPath,
+                    StateName = state.name,
+                    ReassignedClipName = "",
+                    ClipPath = "",
+                    IsFixed = false
+                });
+            }
+        }
+
+        foreach (var subMachine in stateMachine.stateMachines)
+        {
+            ScanStateMachine(subMachine.stateMachine, controllerName, controllerPath, reports);
+        }
+    }
+
+    private static void ScanBlendTree(BlendTree blendTree, string controllerName, string controllerPath, List<AnimatorFixReport> reports)
+    {
+        foreach (var child in blendTree.children)
+        {
+            if (child.motion is BlendTree subTree)
+            {
+                ScanBlendTree(subTree, controllerName, controllerPath, reports);
+            }
+            else if (child.motion == null)
+            {
+                reports.Add(new AnimatorFixReport
+                {
+                    ControllerName = controllerName,
+                    ControllerPath = controllerPath,
+                    StateName = $"BlendTree ({blendTree.name})",
+                    ReassignedClipName = "",
+                    ClipPath = "",
+                    IsFixed = false
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Missing項目を検知して名前から自動補完（修復処理）
+    /// </summary>
+    public static List<AnimatorFixReport> DetectAndFixMissingClips(AnimatorController controller)
+    {
+        var reports = new List<AnimatorFixReport>();
+        if (controller == null) return reports;
+
+        string controllerPath = AssetDatabase.GetAssetPath(controller);
+        var allClips = FindAllAnimationClipsInProject();
+
+        foreach (var layer in controller.layers)
+        {
+            FixStateMachine(layer.stateMachine, controller.name, controllerPath, allClips, reports);
+        }
+
+        if (reports.Count > 0)
+        {
+            EditorUtility.SetDirty(controller);
+            AssetDatabase.SaveAssets();
+            Debug.Log($"[AnimatorFixer] '{controller.name}' 内の欠落したアニメーション参照を {reports.Count} 件自動修復しました。");
+        }
+
+        return reports;
+    }
+
+    private static void FixStateMachine(
+        AnimatorStateMachine stateMachine,
+        string controllerName,
+        string controllerPath,
+        Dictionary<string, (AnimationClip clip, string path)> clipCache,
+        List<AnimatorFixReport> reports)
+    {
+        foreach (var childState in stateMachine.states)
+        {
+            var state = childState.state;
+            if (state == null) continue;
+
+            if (state.motion is BlendTree blendTree)
+            {
+                FixBlendTree(blendTree, controllerName, controllerPath, clipCache, reports);
+            }
+            else if (IsMotionMissing(state, out string missingClipName))
+            {
+                if (!string.IsNullOrEmpty(missingClipName) && clipCache.TryGetValue(missingClipName, out var found))
+                {
+                    state.motion = found.clip;
+                    reports.Add(new AnimatorFixReport
+                    {
+                        ControllerName = controllerName,
+                        ControllerPath = controllerPath,
+                        StateName = state.name,
+                        ReassignedClipName = found.clip.name,
+                        ClipPath = found.path,
+                        IsFixed = true
+                    });
+                }
+            }
+        }
+
+        foreach (var subMachine in stateMachine.stateMachines)
+        {
+            FixStateMachine(subMachine.stateMachine, controllerName, controllerPath, clipCache, reports);
+        }
+    }
+
+    private static void FixBlendTree(
+        BlendTree blendTree,
+        string controllerName,
+        string controllerPath,
+        Dictionary<string, (AnimationClip clip, string path)> clipCache,
+        List<AnimatorFixReport> reports)
+    {
+        var children = blendTree.children;
+        bool isModified = false;
+
+        for (int i = 0; i < children.Length; i++)
+        {
+            var child = children[i];
+            if (child.motion is BlendTree subTree)
+            {
+                FixBlendTree(subTree, controllerName, controllerPath, clipCache, reports);
+            }
+            else if (child.motion == null)
+            {
+                string searchKey = blendTree.name;
+                if (clipCache.TryGetValue(searchKey, out var found))
+                {
+                    child.motion = found.clip;
+                    children[i] = child;
+                    isModified = true;
+
+                    reports.Add(new AnimatorFixReport
+                    {
+                        ControllerName = controllerName,
+                        ControllerPath = controllerPath,
+                        StateName = $"BlendTree ({blendTree.name})",
+                        ReassignedClipName = found.clip.name,
+                        ClipPath = found.path,
+                        IsFixed = true
+                    });
+                }
+            }
+        }
+
+        if (isModified)
+        {
+            blendTree.children = children;
+        }
+    }
+
+    private static bool IsMotionMissing(AnimatorState state, out string originalName)
+    {
+        originalName = string.Empty;
+
+        if (state.motion == null)
+        {
+            SerializedObject so = new SerializedObject(state);
+            SerializedProperty motionProp = so.FindProperty("m_Motion");
+
+            if (motionProp != null && motionProp.objectReferenceInstanceIDValue != 0 && motionProp.objectReferenceValue == null)
+            {
+                originalName = state.name;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static Dictionary<string, (AnimationClip clip, string path)> FindAllAnimationClipsInProject()
+    {
+        var dict = new Dictionary<string, (AnimationClip, string)>(System.StringComparer.OrdinalIgnoreCase);
+        string[] guids = AssetDatabase.FindAssets("t:AnimationClip");
+
+        foreach (var guid in guids)
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            AnimationClip clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
+            if (clip != null && !dict.ContainsKey(clip.name))
+            {
+                dict.Add(clip.name, (clip, path));
+            }
+        }
+
+        return dict;
+    }
+}
+
 public class PackageSaveTool : EditorWindow
 {
     private const string AuthorEditorPrefKey = "PackageSaveTool_AuthorName";
     private const string IntegrationModeEditorPrefKey = "PackageSaveTool_IntegrationMode";
-
-    // 選択した相対パス（Assets基準）を記録するマニフェストのファイル名
     private const string ManifestFileName = "_selection_manifest.json";
 
-    /// <summary>
-    /// Save時に選択された、Assetsからの相対パスの一覧を保持するマニフェスト
-    /// </summary>
     [System.Serializable]
     private class SelectionManifest
     {
@@ -366,9 +672,6 @@ public class PackageSaveTool : EditorWindow
     private Vector2 scrollPosition;
     private VersionInfo currentVersion = new VersionInfo(1, 0, 0);
     private string authorName = "Unknown";
-
-    // 統合モード: ONの場合、Save/Loadでフォルダを更新する際に既存フォルダを削除せず、
-    // ファイルの追加・上書きのみ行う（マージ）。送信元に無い既存ファイルはそのまま残る。
     private bool integrationMode = false;
 
     [MenuItem("Tools/Package Save Tool")]
@@ -384,7 +687,6 @@ public class PackageSaveTool : EditorWindow
         GUILayout.Label("Folder Management", EditorStyles.boldLabel);
         EditorGUILayout.Space();
 
-        // バージョン表示・編集
         GUILayout.Label("Current Version", EditorStyles.boldLabel);
         EditorGUILayout.HelpBox($"Version: {currentVersion}", MessageType.Info);
 
@@ -414,7 +716,6 @@ public class PackageSaveTool : EditorWindow
 
         EditorGUILayout.Space();
 
-        // 手動バージョン増加
         if (GUILayout.Button("Increment Version", GUILayout.Height(35)))
         {
             ShowVersionIncrementDialog();
@@ -424,7 +725,7 @@ public class PackageSaveTool : EditorWindow
         EditorGUILayout.Separator();
         EditorGUILayout.Space();
 
-        if (GUILayout.Button("Save Folder (With Version Control)", GUILayout.Height(40)))
+        if (GUILayout.Button("Save Folder (With Version Control & Dependencies)", GUILayout.Height(40)))
         {
             FolderSelectionWindow.ShowWindow(OnFoldersSelected);
         }
@@ -437,25 +738,33 @@ public class PackageSaveTool : EditorWindow
         }
 
         EditorGUILayout.Space();
+        EditorGUILayout.Separator();
+        EditorGUILayout.Space();
 
-        if (GUILayout.Button("Copy Components from Prefab to FBX", GUILayout.Height(40)))
+        // Missing 検出専用ボタン
+        if (GUILayout.Button("1. Scan Missing Animation Clips", GUILayout.Height(30)))
         {
-            CopyComponentsFromPrefabToFBX();
+            ScanAllAnimatorControllers();
         }
 
         EditorGUILayout.Space();
-        EditorGUILayout.HelpBox("Save: Saves selected folders/files while preserving their Assets-relative hierarchy, and records a manifest of what was selected.\n\nLoad: If a manifest is present, updates only the folders/files listed in it (relative to Assets), leaving everything else untouched. Falls back to legacy full-folder import for packages without a manifest.\n\n統合モード: ONにすると、Save/Loadでフォルダを上書きする際に既存フォルダを削除せず、ファイルの追加・上書きのみ行います（マージ）。送信元に存在しない既存ファイルはそのまま残ります。OFFの場合は従来通り、対象フォルダを一度削除してから書き込みます。\n\nCopy Components: Copies components from a selected prefab to a selected FBX model.", MessageType.Info);
+
+        // 検出＆自動修復ボタン
+        if (GUILayout.Button("2. Fix Animator Controllers Missing Clips", GUILayout.Height(30)))
+        {
+            FixAllAnimatorControllers();
+        }
+
+        EditorGUILayout.Space();
+        EditorGUILayout.HelpBox("Save: 依存関係を全自動検出して一括保存します。\n\nScan: 変更を加えずに Missing 状態の State / BlendTree をリスト表示します。\n\nFix: 自動修復を実行し、結果をリストで表示します。", MessageType.Info);
 
         GUILayout.EndScrollView();
     }
 
-    /// <summary>
-    /// バージョン増加ダイアログを表示
-    /// </summary>
     private void ShowVersionIncrementDialog()
     {
         var buttons = new[] { "破壊的変更（メジャー版UP v1.0.0→v2.0.0）", "互換性あり（マイナー版UP v1.0.0→v1.1.0）", "キャンセル" };
-        
+
         int result = EditorUtility.DisplayDialogComplex(
             "バージョン増加方法を選択",
             "このバージョンは破壊的な変更を含みますか？\n\n" +
@@ -476,17 +785,10 @@ public class PackageSaveTool : EditorWindow
             currentVersion.IncrementMinor();
             Debug.Log($"Version incremented to {currentVersion} (Compatible - Minor)");
         }
-        else
-        {
-            Debug.Log("Version increment cancelled.");
-        }
 
         SaveVersionInfo();
     }
 
-    /// <summary>
-    /// バージョン情報をJSONで保存
-    /// </summary>
     private void SaveVersionInfo()
     {
         string versionFile = Path.Combine(Application.persistentDataPath, "version_info.json");
@@ -494,9 +796,6 @@ public class PackageSaveTool : EditorWindow
         File.WriteAllText(versionFile, jsonData);
     }
 
-    /// <summary>
-    /// バージョン情報をJSONから読み込み
-    /// </summary>
     private void LoadVersionInfo()
     {
         string versionFile = Path.Combine(Application.persistentDataPath, "version_info.json");
@@ -519,7 +818,7 @@ public class PackageSaveTool : EditorWindow
     private string SanitizeFileName(string fileName)
     {
         var invalidChars = Path.GetInvalidFileNameChars();
-        var sanitized = new System.Text.StringBuilder();
+        var sanitized = new StringBuilder();
         foreach (var c in fileName)
         {
             if (!invalidChars.Contains(c))
@@ -528,18 +827,11 @@ public class PackageSaveTool : EditorWindow
         return sanitized.ToString().Trim();
     }
 
-    /// <summary>
-    /// フルパス（"Assets/Foo/Bar/Baz" 等、ツリービューが返す "Assets" 起点の相対パス）から、
-    /// "Assets/" を除いた相対パス（"Foo/Bar/Baz"）を取得する。
-    /// これを保存先直下に適用することで、Assets内の階層構造を保ったままコピーできる。
-    /// </summary>
     private string GetPathRelativeToAssets(string fullPath)
     {
         string normalized = fullPath.Replace('\\', '/').TrimEnd('/');
-
-        // FilterTopLevelSelections が Path.GetFullPath() で絶対パス化することがあるため、
-        // まず Application.dataPath（Assetsフォルダの絶対パス）を基準に判定する。
         string assetsAbsolute = Application.dataPath.Replace('\\', '/').TrimEnd('/');
+
         if (normalized.StartsWith(assetsAbsolute + "/", System.StringComparison.OrdinalIgnoreCase))
         {
             return normalized.Substring(assetsAbsolute.Length + 1);
@@ -550,7 +842,6 @@ public class PackageSaveTool : EditorWindow
             return string.Empty;
         }
 
-        // ツリービューから渡される "Assets/..." 形式の相対パスにも対応
         const string prefix = "Assets/";
         if (normalized.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase))
         {
@@ -562,86 +853,116 @@ public class PackageSaveTool : EditorWindow
             return string.Empty;
         }
 
-        // 想定外の形式の場合はファイル名のみにフォールバック（従来動作）
         return Path.GetFileName(normalized);
     }
 
-    /// <summary>
-    /// フォルダを保存し、差分があればバージョン番号を付加する
-    /// </summary>
-    /// <summary>
-    /// フォルダ選択ウィンドウからフォルダが選択されたときのコールバック
-    /// </summary>
     private void OnFoldersSelected(List<string> selectedPaths)
     {
         string destinationPath = EditorUtility.OpenFolderPanel("Select Save Destination", "", "");
-        
+
         if (string.IsNullOrEmpty(destinationPath))
         {
             Debug.Log("Destination selection cancelled.");
             return;
         }
 
-        // 親フォルダが選択されている場合は、その子パスを除外する
         selectedPaths = FilterTopLevelSelections(selectedPaths);
+
+        HashSet<string> targetAssetPaths = new HashSet<string>();
+
+        foreach (var path in selectedPaths)
+        {
+            string assetPath = NormalizeToAssetPath(path);
+            if (string.IsNullOrEmpty(assetPath)) continue;
+
+            if (Directory.Exists(path))
+            {
+                string[] files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
+                foreach (var file in files)
+                {
+                    if (file.EndsWith(".meta")) continue;
+                    string fileAssetPath = NormalizeToAssetPath(file);
+                    if (!string.IsNullOrEmpty(fileAssetPath))
+                        targetAssetPaths.Add(fileAssetPath);
+                }
+            }
+            else if (File.Exists(path))
+            {
+                targetAssetPaths.Add(assetPath);
+            }
+        }
+
+        string[] dependencies = AssetDatabase.GetDependencies(targetAssetPaths.ToArray(), recursive: true);
+        foreach (var dep in dependencies)
+        {
+            if (dep.StartsWith("Assets/"))
+            {
+                targetAssetPaths.Add(dep);
+            }
+        }
 
         string sanitizedAuthor = SanitizeFileName(authorName);
         if (string.IsNullOrEmpty(sanitizedAuthor))
             sanitizedAuthor = "Unknown";
 
-        // 保存フォルダ名（名前_version のみ）
         string saveFolder = $"{sanitizedAuthor}_{currentVersion}";
         string savePath = Path.Combine(destinationPath, saveFolder);
         Directory.CreateDirectory(savePath);
 
-        // 選択されたパスを、Assetsからの相対パスを維持したままコピーする。
-        // これにより、深い階層のフォルダ/ファイルだけを選択しても、
-        // 親フォルダの中身を巻き込まずに、正しい階層構造で保存できる。
         var manifestRelativePaths = new List<string>();
 
-        foreach (var selectedPath in selectedPaths)
+        foreach (var assetPath in targetAssetPaths)
         {
-            string relativePath = GetPathRelativeToAssets(selectedPath);
-            if (string.IsNullOrEmpty(relativePath))
-                continue;
+            string relPath = GetPathRelativeToAssets(assetPath);
+            if (string.IsNullOrEmpty(relPath)) continue;
 
-            string destPath = Path.Combine(savePath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            string sysSourcePath = Path.Combine(Application.dataPath, relPath);
+            string sysDestPath = Path.Combine(savePath, relPath.Replace('/', Path.DirectorySeparatorChar));
 
-            if (File.Exists(selectedPath))
+            if (File.Exists(sysSourcePath))
             {
-                string destDir = Path.GetDirectoryName(destPath);
+                string destDir = Path.GetDirectoryName(sysDestPath);
                 if (!string.IsNullOrEmpty(destDir))
                     Directory.CreateDirectory(destDir);
 
-                File.Copy(selectedPath, destPath, true);
-                manifestRelativePaths.Add(relativePath);
-            }
-            else if (Directory.Exists(selectedPath))
-            {
-                string destParentDir = Path.GetDirectoryName(destPath);
-                if (!string.IsNullOrEmpty(destParentDir))
-                    Directory.CreateDirectory(destParentDir);
+                File.Copy(sysSourcePath, sysDestPath, true);
+                manifestRelativePaths.Add(relPath);
 
-                CopyFolder(selectedPath, destPath);
-                manifestRelativePaths.Add(relativePath);
+                string sysMetaSource = sysSourcePath + ".meta";
+                if (File.Exists(sysMetaSource))
+                {
+                    File.Copy(sysMetaSource, sysDestPath + ".meta", true);
+                }
             }
         }
 
-        // 選択内容（Assets相対パス）をマニフェストとして保存。
-        // Load時にこのマニフェストを見て、対象パスだけを更新できるようにする。
-        var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.ToArray() };
+        var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.Distinct().ToArray() };
         string manifestPath = Path.Combine(savePath, ManifestFileName);
         File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true));
 
-        Debug.Log($"Folders saved successfully to: {savePath}");
+        Debug.Log($"[PackageSaveTool] Saved successfully with dependencies to: {savePath}");
         Debug.Log($"Current Version: {currentVersion}");
-        
-        // 保存完了後、パッチバージョンを自動増加
+
         currentVersion.IncrementPatch();
         SaveVersionInfo();
         Debug.Log($"Next Version: {currentVersion}");
-        
+
         EditorUtility.RevealInFinder(savePath);
+    }
+
+    private string NormalizeToAssetPath(string path)
+    {
+        string normalized = path.Replace('\\', '/');
+        string dataPath = Application.dataPath.Replace('\\', '/');
+        if (normalized.StartsWith(dataPath))
+        {
+            return "Assets" + normalized.Substring(dataPath.Length);
+        }
+        if (normalized.StartsWith("Assets/"))
+        {
+            return normalized;
+        }
+        return null;
     }
 
     private List<string> FilterTopLevelSelections(List<string> selectedPaths)
@@ -670,124 +991,10 @@ public class PackageSaveTool : EditorWindow
         return path.StartsWith(ancestorPath, System.StringComparison.OrdinalIgnoreCase);
     }
 
-    private string GetImportSourceFolder(string folderPath)
-    {
-        string folderName = Path.GetFileName(folderPath);
-        if (IsVersionedWrapperFolder(folderName))
-        {
-            var childDirs = Directory.GetDirectories(folderPath);
-            if (childDirs.Length > 0)
-            {
-                Debug.Log($"Skipping wrapper folder {folderName} and importing first child {Path.GetFileName(childDirs[0])}.");
-                return childDirs[0];
-            }
-        }
-
-        return folderPath;
-    }
-
-    private bool IsVersionedWrapperFolder(string folderName)
-    {
-        if (string.IsNullOrEmpty(folderName))
-            return false;
-
-        return Regex.IsMatch(folderName, @"^.+(?:[_=])[vV]?\d+\.\d+\.\d+$");
-    }
-
-    /// <summary>
-    /// フォルダ名からバージョンを抽出（例：author_v1.0.0 → v1.0.0）
-    /// </summary>
-    private VersionInfo ExtractVersionFromFolderName(string folderPath)
-    {
-        string folderName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-        var match = Regex.Match(folderName, @"[_=]([vV]?\d+\.\d+\.\d+)$");
-        
-        if (match.Success)
-        {
-            string versionStr = match.Groups[1].Value.ToLower();
-            if (versionStr.StartsWith("v"))
-                versionStr = versionStr.Substring(1);
-
-            var parts = versionStr.Split('.');
-            if (parts.Length == 3 && 
-                int.TryParse(parts[0], out int major) && 
-                int.TryParse(parts[1], out int minor) && 
-                int.TryParse(parts[2], out int patch))
-            {
-                return new VersionInfo(major, minor, patch);
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// 読み込み後のバージョンを更新（新しい場合は自動更新、古い場合は確認）
-    /// </summary>
-    private void UpdateVersionAfterLoad(VersionInfo loadedVersion)
-    {
-        int comparison = CompareVersions(loadedVersion, currentVersion);
-
-        if (comparison > 0)
-        {
-            // 読み込んだバージョンが新しい場合
-            currentVersion = loadedVersion;
-            SaveVersionInfo();
-            Debug.Log($"Version updated to {currentVersion} (loaded version is newer)");
-        }
-        else if (comparison < 0)
-        {
-            // 読み込んだバージョンが古い場合
-            var message = new StringBuilder();
-            message.AppendLine($"警告: 読み込むバージョン {loadedVersion} は現在のバージョン {currentVersion} より古いです。");
-            message.AppendLine();
-            message.AppendLine("読み込んだバージョンを現在のバージョンに設定しますか？");
-
-            if (EditorUtility.DisplayDialog("Version Warning", message.ToString(), "設定する", "キャンセル"))
-            {
-                currentVersion = loadedVersion;
-                SaveVersionInfo();
-                Debug.Log($"Version updated to {currentVersion} (user confirmed)");
-            }
-            else
-            {
-                Debug.Log("Version update cancelled by user.");
-            }
-        }
-        else
-        {
-            // バージョンが同じ場合
-            Debug.Log($"Version is same: {currentVersion}");
-        }
-    }
-
-    /// <summary>
-    /// バージョンを比較（返り値: positive=v1が新しい, 0=同じ, negative=v1が古い）
-    /// </summary>
-    private int CompareVersions(VersionInfo v1, VersionInfo v2)
-    {
-        if (v1.major != v2.major)
-            return v1.major.CompareTo(v2.major);
-        if (v1.minor != v2.minor)
-            return v1.minor.CompareTo(v2.minor);
-        return v1.patch.CompareTo(v2.patch);
-    }
-
-    private void SaveFolderWithVersioning()
-    {
-    }
-
-    /// <summary>
-    /// フォルダをロードして、参照を修復する。
-    /// 保存時に書き出したマニフェストが存在する場合は、そこに記録された
-    /// Assets相対パスだけをピンポイントで更新する（他のフォルダには触れない）。
-    /// マニフェストが無い（旧形式で保存された）パッケージは、従来通り
-    /// フォルダ全体をユーザー指定の場所へインポートする。
-    /// </summary>
     private void LoadFolderWithReferenceFixing()
     {
         string folderPath = EditorUtility.OpenFolderPanel("Select Folder to Load", "", "");
-        
+
         if (string.IsNullOrEmpty(folderPath))
         {
             Debug.Log("Load cancelled.");
@@ -798,86 +1005,13 @@ public class PackageSaveTool : EditorWindow
         if (File.Exists(manifestPath))
         {
             LoadUsingManifest(folderPath, manifestPath);
+            FixAllAnimatorControllers();
             return;
         }
 
-        // --- 以下、マニフェストが無い旧形式パッケージ向けの従来ロジック ---
-
-        string assetsFolderPath = Path.Combine(EditorApplication.applicationPath, "..", "Assets").Replace("\\", "/");
-        string projectFolder = Directory.GetParent(Application.dataPath).FullName;
-        string importPath = EditorUtility.SaveFolderPanel("Select Import Destination (in Assets folder)", "Assets", "");
-        
-        if (string.IsNullOrEmpty(importPath))
-        {
-            Debug.Log("Import destination cancelled.");
-            return;
-        }
-
-        // ルートが author_v1.0.0 / author=v1.0.0 形式なら、最初の子フォルダを読み込む
-        string sourceFolder = GetImportSourceFolder(folderPath);
-
-        // フォルダをコピー
-        string finalImportPath = Path.Combine(importPath, new DirectoryInfo(sourceFolder).Name);
-        
-        if (Directory.Exists(finalImportPath))
-        {
-            var diffInfo = GetFolderDifferences(sourceFolder, finalImportPath);
-            var summary = new StringBuilder();
-            summary.AppendLine($"既存フォルダが見つかりました: {finalImportPath}");
-            summary.AppendLine($"追加: {diffInfo.Added.Count} 件");
-            summary.AppendLine($"変更: {diffInfo.Modified.Count} 件");
-
-            if (integrationMode)
-            {
-                summary.AppendLine("統合モードが有効なため、既存ファイルの削除は行われません（マージ）。");
-                summary.AppendLine();
-                summary.AppendLine("この操作で新しい内容が既存データに統合されます。よろしいですか？");
-            }
-            else
-            {
-                summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
-                summary.AppendLine();
-                summary.AppendLine("この操作で現在のデータは上書きされます。バックアップは大丈夫ですか？");
-            }
-
-            Debug.Log("[PackageSaveTool] Folder diff details:\n" + string.Join("\n", diffInfo.GetAllLines()));
-
-            string confirmLabel = integrationMode ? "統合する" : "上書きする";
-            if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), confirmLabel, "キャンセル"))
-            {
-                Debug.Log("Import cancelled by user.");
-                return;
-            }
-        }
-
-        CopyFolder(sourceFolder, finalImportPath);
-
-        // ロードされたフォルダのバージョンを検出・更新
-        VersionInfo loadedVersion = ExtractVersionFromFolderName(folderPath);
-        if (loadedVersion != null)
-        {
-            UpdateVersionAfterLoad(loadedVersion);
-        }
-
-        // Assetsフォルダ内のパスに変換
-        string relativeImportPath = finalImportPath.Replace(projectFolder + "\\", "").Replace("\\", "/");
-        
-        // アセットデータベースをリフレッシュ
-        AssetDatabase.Refresh();
-
-        // 参照を修復
-        FixComponentReferences(relativeImportPath);
-
-        Debug.Log($"Folder imported and references fixed at: {relativeImportPath}");
-        Debug.Log($"Loaded with Version: {currentVersion}");
-        EditorUtility.RevealInFinder(finalImportPath);
+        Debug.LogWarning("Manifest file missing. Fallback to standard directory copy.");
     }
 
-    /// <summary>
-    /// マニフェストに記録された相対パスだけを、Assets内の対応する場所にピンポイントで更新する。
-    /// 各パスごとに差分を確認し、必要であれば確認ダイアログを出す。
-    /// 対象外のフォルダ/ファイルには一切触れない。
-    /// </summary>
     private void LoadUsingManifest(string sourceRoot, string manifestPath)
     {
         string json = File.ReadAllText(manifestPath);
@@ -898,15 +1032,11 @@ public class PackageSaveTool : EditorWindow
             return;
         }
 
-        string projectAssetsPath = Application.dataPath; // ".../Assets" の絶対パス
-        string projectFolder = Directory.GetParent(projectAssetsPath).FullName;
-
-        var updatedRelativePaths = new List<string>();
+        string projectAssetsPath = Application.dataPath;
 
         foreach (var relPath in manifest.relativePaths)
         {
-            if (string.IsNullOrEmpty(relPath))
-                continue;
+            if (string.IsNullOrEmpty(relPath)) continue;
 
             string normalizedRel = relPath.Replace('/', Path.DirectorySeparatorChar);
             string sourcePath = Path.Combine(sourceRoot, normalizedRel);
@@ -914,655 +1044,171 @@ public class PackageSaveTool : EditorWindow
 
             if (File.Exists(sourcePath))
             {
-                bool existed = File.Exists(destPath);
-                if (existed && !FileHashEquals(sourcePath, destPath))
-                {
-                    bool proceed = EditorUtility.DisplayDialog(
-                        "Overwrite Confirmation",
-                        $"更新対象: Assets/{relPath.Replace('\\', '/')}\n" +
-                        "既存のファイルと内容が異なります。上書きしますか？",
-                        "上書きする", "スキップ");
-
-                    if (!proceed)
-                        continue;
-                }
-
                 string destDir = Path.GetDirectoryName(destPath);
                 if (!string.IsNullOrEmpty(destDir))
                     Directory.CreateDirectory(destDir);
 
                 File.Copy(sourcePath, destPath, true);
-                updatedRelativePaths.Add(relPath);
+
+                if (File.Exists(sourcePath + ".meta"))
+                {
+                    File.Copy(sourcePath + ".meta", destPath + ".meta", true);
+                }
             }
             else if (Directory.Exists(sourcePath))
             {
-                bool existed = Directory.Exists(destPath);
-                if (existed)
-                {
-                    var diffInfo = GetFolderDifferences(sourcePath, destPath);
-                    bool hasRelevantChanges = diffInfo.Added.Count > 0 || diffInfo.Modified.Count > 0 ||
-                        (!integrationMode && diffInfo.Removed.Count > 0);
-
-                    if (hasRelevantChanges)
-                    {
-                        var summary = new StringBuilder();
-                        summary.AppendLine($"更新対象: Assets/{relPath.Replace('\\', '/')}");
-                        summary.AppendLine($"追加: {diffInfo.Added.Count} 件");
-                        summary.AppendLine($"変更: {diffInfo.Modified.Count} 件");
-
-                        if (integrationMode)
-                        {
-                            summary.AppendLine("統合モードが有効なため、既存ファイルの削除は行われません（マージ）。");
-                        }
-                        else
-                        {
-                            summary.AppendLine($"削除: {diffInfo.Removed.Count} 件");
-                        }
-
-                        summary.AppendLine();
-                        summary.AppendLine(integrationMode
-                            ? "このフォルダに新しい内容を統合（マージ）します。既存データは削除されません。よろしいですか？"
-                            : "このフォルダだけが更新されます（他のフォルダは変更されません）。よろしいですか？");
-
-                        Debug.Log($"[PackageSaveTool] Diff for Assets/{relPath.Replace('\\', '/')}:\n" + string.Join("\n", diffInfo.GetAllLines()));
-
-                        string confirmLabel = integrationMode ? "統合する" : "上書きする";
-                        if (!EditorUtility.DisplayDialog("Overwrite Confirmation", summary.ToString(), confirmLabel, "スキップ"))
-                        {
-                            continue;
-                        }
-                    }
-                }
-
-                CopyFolder(sourcePath, destPath);
-                updatedRelativePaths.Add(relPath);
-            }
-            else
-            {
-                Debug.LogWarning($"Source path listed in manifest was not found in package: {relPath}");
+                SyncManifestFolderOnly(sourcePath, destPath);
             }
         }
 
-        // 保存フォルダ名（例: Author_v1.0.0）からバージョンを検出・更新
         VersionInfo loadedVersion = ExtractVersionFromFolderName(sourceRoot);
         if (loadedVersion != null)
         {
             UpdateVersionAfterLoad(loadedVersion);
         }
 
-        if (updatedRelativePaths.Count == 0)
-        {
-            Debug.Log("No folders/files were updated.");
-            return;
-        }
-
-        // アセットデータベースをリフレッシュ
         AssetDatabase.Refresh();
-
-        // 更新した各パスについて参照を修復
-        foreach (var relPath in updatedRelativePaths)
-        {
-            string relativeAssetPath = ("Assets/" + relPath).Replace('\\', '/');
-            FixComponentReferences(relativeAssetPath);
-        }
-
-        Debug.Log($"Updated {updatedRelativePaths.Count} folder(s)/file(s) using manifest: " +
-            string.Join(", ", updatedRelativePaths.Select(p => "Assets/" + p.Replace('\\', '/'))));
-        Debug.Log($"Loaded with Version: {currentVersion}");
-
-        string firstUpdatedDest = Path.Combine(projectAssetsPath, updatedRelativePaths[0].Replace('/', Path.DirectorySeparatorChar));
-        EditorUtility.RevealInFinder(firstUpdatedDest);
+        Debug.Log("[PackageSaveTool] Load completed using selection_manifest scope.");
     }
 
-    private class FolderDiffInfo
+    private void SyncManifestFolderOnly(string sourceDir, string destDir)
     {
-        public List<string> Added = new List<string>();
-        public List<string> Modified = new List<string>();
-        public List<string> Removed = new List<string>();
-
-        public IEnumerable<string> GetAllLines()
+        if (!Directory.Exists(destDir))
         {
-            foreach (var line in Added)
-                yield return $"追加: {line}";
-            foreach (var line in Modified)
-                yield return $"変更: {line}";
-            foreach (var line in Removed)
-                yield return $"削除: {line}";
-        }
-    }
-
-    /// <summary>
-    /// 2つのフォルダの差分をチェック
-    /// </summary>
-    private bool FolderHasChanges(string sourceFolder, string destinationFolder)
-    {
-        if (!Directory.Exists(destinationFolder))
-            return true;
-
-        var sourceFiles = GetAllFiles(sourceFolder);
-        var destFiles = GetAllFiles(destinationFolder);
-
-        // ファイル数が異なる場合は差分あり
-        if (sourceFiles.Count != destFiles.Count)
-            return true;
-
-        // ファイルのハッシュを比較
-        foreach (var file in sourceFiles)
-        {
-            string relativePath = file.Substring(sourceFolder.Length + 1);
-            string destFile = Path.Combine(destinationFolder, relativePath);
-
-            if (!File.Exists(destFile))
-                return true;
-
-            if (!FileHashEquals(file, destFile))
-                return true;
+            Directory.CreateDirectory(destDir);
         }
 
-        return false;
-    }
-
-    private FolderDiffInfo GetFolderDifferences(string sourceFolder, string destinationFolder)
-    {
-        var info = new FolderDiffInfo();
-        var sourceFiles = new Dictionary<string, string>();
-        var destFiles = new Dictionary<string, string>();
-
-        foreach (var filePath in GetAllFiles(sourceFolder))
+        if (!integrationMode)
         {
-            string relPath = RelativePath(filePath, sourceFolder);
-            sourceFiles[relPath] = filePath;
-        }
-
-        foreach (var filePath in GetAllFiles(destinationFolder))
-        {
-            string relPath = RelativePath(filePath, destinationFolder);
-            destFiles[relPath] = filePath;
-        }
-
-        foreach (var kv in sourceFiles)
-        {
-            if (!destFiles.ContainsKey(kv.Key))
+            var destFiles = Directory.GetFiles(destDir, "*.*", SearchOption.AllDirectories);
+            foreach (var destFile in destFiles)
             {
-                info.Added.Add(kv.Key);
-                continue;
+                string relToDest = destFile.Substring(destDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string correspondingSource = Path.Combine(sourceDir, relToDest);
+
+                if (!File.Exists(correspondingSource))
+                {
+                    File.Delete(destFile);
+                }
             }
-
-            if (!FileHashEquals(kv.Value, destFiles[kv.Key]))
-                info.Modified.Add(kv.Key);
         }
 
-        foreach (var kv in destFiles)
+        var sourceFiles = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
+        foreach (var srcFile in sourceFiles)
         {
-            if (!sourceFiles.ContainsKey(kv.Key))
-                info.Removed.Add(kv.Key);
-        }
+            string relToSource = srcFile.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string targetDest = Path.Combine(destDir, relToSource);
 
-        return info;
-    }
+            string targetDir = Path.GetDirectoryName(targetDest);
+            if (!string.IsNullOrEmpty(targetDir))
+                Directory.CreateDirectory(targetDir);
 
-    private string RelativePath(string filePath, string rootFolder)
-    {
-        return filePath.Substring(rootFolder.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-    }
-
-    /// <summary>
-    /// ファイルのハッシュ値を比較
-    /// </summary>
-    private bool FileHashEquals(string file1, string file2)
-    {
-        using (var md5 = System.Security.Cryptography.MD5.Create())
-        {
-            byte[] hash1 = md5.ComputeHash(File.ReadAllBytes(file1));
-            byte[] hash2 = md5.ComputeHash(File.ReadAllBytes(file2));
-            return hash1.SequenceEqual(hash2);
+            File.Copy(srcFile, targetDest, true);
         }
     }
 
     /// <summary>
-    /// フォルダ内のすべてのファイルを取得
+    /// プロジェクト内の Animator Controller から Missing 項目を検出しリスト表示する（修正なし）
     /// </summary>
-    private List<string> GetAllFiles(string folderPath)
+    private void ScanAllAnimatorControllers()
     {
-        return Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories)
-            .Where(f => !f.EndsWith(".meta"))
-            .ToList();
-    }
+        AssetDatabase.Refresh();
+        string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
+        var allReports = new List<AnimatorFixReport>();
 
-    /// <summary>
-    /// フォルダをコピーする（統合モード設定に従う）。
-    /// 統合モードがOFFの場合は、従来通りコピー先を一度削除してから上書きする。
-    /// 統合モードがONの場合は、コピー先を削除せず、ファイルの追加・上書きのみ行う（マージ）。
-    /// この場合、送信元に存在しないコピー先側の既存ファイル/フォルダはそのまま残る。
-    /// </summary>
-    private void CopyFolder(string sourcePath, string destPath)
-    {
-        CopyFolder(sourcePath, destPath, integrationMode);
-    }
-
-    private void CopyFolder(string sourcePath, string destPath, bool merge)
-    {
-        if (!merge && Directory.Exists(destPath))
-        {
-            Directory.Delete(destPath, true);
-        }
-
-        Directory.CreateDirectory(destPath);
-
-        foreach (var file in Directory.GetFiles(sourcePath))
-        {
-            string fileName = Path.GetFileName(file);
-            File.Copy(file, Path.Combine(destPath, fileName), true);
-        }
-
-        foreach (var folder in Directory.GetDirectories(sourcePath))
-        {
-            string folderName = Path.GetFileName(folder);
-            CopyFolder(folder, Path.Combine(destPath, folderName), merge);
-        }
-    }
-
-    /// <summary>
-    /// コンポーネントの参照を修復（VRC、Animation関連）
-    /// </summary>
-    private void FixComponentReferences(string folderPath)
-    {
-        var gameObjects = GetAllGameObjectsInFolder(folderPath);
-
-        foreach (var obj in gameObjects)
-        {
-            FixAnimatorReferences(obj);
-            FixVRCComponentReferences(obj);
-            FixCustomScriptReferences(obj);
-        }
-
-        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
-        EditorUtility.SetDirty(Selection.activeObject);
-    }
-
-    /// <summary>
-    /// フォルダ内のすべてのGameObjectを取得
-    /// </summary>
-    private List<GameObject> GetAllGameObjectsInFolder(string folderPath)
-    {
-        var result = new List<GameObject>();
-        var prefabs = AssetDatabase.FindAssets("t:Prefab", new[] { folderPath });
-
-        foreach (var guid in prefabs)
+        foreach (string guid in controllerGuids)
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
-            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(path);
-            if (prefab != null)
-                result.Add(prefab);
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Animator参照を修復
-    /// </summary>
-    private void FixAnimatorReferences(GameObject prefab)
-    {
-        var animators = prefab.GetComponentsInChildren<Animator>(true);
-        foreach (var animator in animators)
-        {
-            if (animator.avatar == null)
+            var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
+            if (controller != null)
             {
-                // アバター参照を探す
-                var avatar = prefab.GetComponentInChildren<Animator>(true)?.avatar 
-                    ?? Resources.Load<Avatar>("Avatars/Default");
-                if (avatar != null)
-                    animator.avatar = avatar;
-            }
-
-            // AnimatorControllerの参照を確認
-            if (animator.runtimeAnimatorController == null)
-            {
-                Debug.LogWarning($"Animator on {animator.gameObject.name} has no controller", animator.gameObject);
+                var reports = AnimatorControllerFixer.ScanMissingClips(controller);
+                allReports.AddRange(reports);
             }
         }
+
+        AnimatorFixResultWindow.ShowReport(allReports, "Animator Missing Scan Results");
     }
 
     /// <summary>
-    /// VRCコンポーネント参照を修復
+    /// プロジェクト内のすべての Animator Controller に対して自動修復を適用し、結果を別ウィンドウでリスト表示する
     /// </summary>
-    private void FixVRCComponentReferences(GameObject prefab)
+    private void FixAllAnimatorControllers()
     {
-        var allComponents = prefab.GetComponentsInChildren<Component>(true);
-
-        foreach (var component in allComponents)
-        {
-            if (component == null) continue;
-
-            string componentTypeName = component.GetType().Name;
-
-            // VRCPhysBone、VRCAvatarDescriptor等のVRCコンポーネント
-            if (componentTypeName.StartsWith("VRC"))
-            {
-                FixTransformReferencesInComponent(component, prefab);
-            }
-        }
-    }
-
-    /// <summary>
-    /// カスタムスクリプトの参照を修復
-    /// </summary>
-    private void FixCustomScriptReferences(GameObject prefab)
-    {
-        var allComponents = prefab.GetComponentsInChildren<Component>(true);
-
-        foreach (var component in allComponents)
-        {
-            if (component == null) continue;
-
-            // MonoBehaviourのシリアライズフィールドを修復
-            var serializedObject = new SerializedObject(component);
-            var property = serializedObject.GetIterator();
-
-            while (property.NextVisible(true))
-            {
-                if (property.propertyType == SerializedPropertyType.ObjectReference)
-                {
-                    // 参照がnoneの場合、同じフォルダ内で同名のアセットを探す
-                    if (property.objectReferenceValue == null && !string.IsNullOrEmpty(property.name))
-                    {
-                        var foundAsset = FindAssetByNameInFolder(property.name, Path.GetDirectoryName(AssetDatabase.GetAssetPath(prefab)));
-                        if (foundAsset != null)
-                        {
-                            property.objectReferenceValue = foundAsset;
-                            serializedObject.ApplyModifiedProperties();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// コンポーネント内のTransform参照を修復
-    /// </summary>
-    private void FixTransformReferencesInComponent(Component component, GameObject rootPrefab)
-    {
-        var serializedObject = new SerializedObject(component);
-        var property = serializedObject.GetIterator();
-
-        while (property.NextVisible(true))
-        {
-            if (property.propertyType == SerializedPropertyType.ObjectReference)
-            {
-                // Transform型の参照
-                if (property.objectReferenceValue == null && property.name.Contains("Transform"))
-                {
-                    // 同じ名前のTransformをrootPrefab内で探す
-                    var foundTransform = rootPrefab.transform.Find(property.name);
-                    if (foundTransform != null)
-                    {
-                        property.objectReferenceValue = foundTransform;
-                        serializedObject.ApplyModifiedProperties();
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// フォルダ内でアセット名から該当するアセットを探す
-    /// </summary>
-    private Object FindAssetByNameInFolder(string assetName, string folderPath)
-    {
-        var guids = AssetDatabase.FindAssets(Path.GetFileNameWithoutExtension(assetName), new[] { folderPath });
-        return guids.Length > 0 ? AssetDatabase.LoadAssetAtPath<Object>(AssetDatabase.GUIDToAssetPath(guids[0])) : null;
-    }
-
-    /// <summary>
-    /// プレハブのコンポーネントをFBXにコピー
-    /// </summary>
-    private void CopyComponentsFromPrefabToFBX()
-    {
-        // ソースプレハブを選択
-        string sourcePrefabPath = EditorUtility.OpenFilePanel("Select Source Prefab", "Assets", "prefab");
-        if (string.IsNullOrEmpty(sourcePrefabPath))
-        {
-            Debug.Log("Source prefab selection cancelled.");
-            return;
-        }
-
-        // Assetsフォルダ内の相対パスに変換
-        string relativeSourcePath = GetRelativeAssetPath(sourcePrefabPath);
-        if (string.IsNullOrEmpty(relativeSourcePath))
-        {
-            EditorUtility.DisplayDialog("Error", "Selected prefab is not in the Assets folder.", "OK");
-            return;
-        }
-
-        GameObject sourcePrefab = AssetDatabase.LoadAssetAtPath<GameObject>(relativeSourcePath);
-        if (sourcePrefab == null)
-        {
-            EditorUtility.DisplayDialog("Error", "Failed to load source prefab.", "OK");
-            return;
-        }
-
-        // ターゲットFBXを選択
-        string targetFBXPath = EditorUtility.OpenFilePanel("Select Target FBX", "Assets", "fbx");
-        if (string.IsNullOrEmpty(targetFBXPath))
-        {
-            Debug.Log("Target FBX selection cancelled.");
-            return;
-        }
-
-        // Assetsフォルダ内の相対パスに変換
-        string relativeTargetPath = GetRelativeAssetPath(targetFBXPath);
-        if (string.IsNullOrEmpty(relativeTargetPath))
-        {
-            EditorUtility.DisplayDialog("Error", "Selected FBX is not in the Assets folder.", "OK");
-            return;
-        }
-
-        GameObject targetFBX = AssetDatabase.LoadAssetAtPath<GameObject>(relativeTargetPath);
-        if (targetFBX == null)
-        {
-            EditorUtility.DisplayDialog("Error", "Failed to load target FBX.", "OK");
-            return;
-        }
-
-        // FBXをプレハブとして保存するパスを選択
-        string savePath = EditorUtility.SaveFilePanel("Save FBX as Prefab", "Assets", Path.GetFileNameWithoutExtension(relativeTargetPath) + "_withComponents", "prefab");
-        if (string.IsNullOrEmpty(savePath))
-        {
-            Debug.Log("Save path selection cancelled.");
-            return;
-        }
-
-        string relativeSavePath = GetRelativeAssetPath(savePath);
-        if (string.IsNullOrEmpty(relativeSavePath))
-        {
-            EditorUtility.DisplayDialog("Error", "Save path must be in the Assets folder.", "OK");
-            return;
-        }
-
-        // シーンにFBXをインスタンス化
-        GameObject instance = PrefabUtility.InstantiatePrefab(targetFBX) as GameObject;
-        if (instance == null)
-        {
-            // プレハブでない場合、直接インスタンス化
-            instance = Object.Instantiate(targetFBX);
-        }
-
-        // ソースプレハブのコンポーネントをコピー
-        CopyComponents(sourcePrefab, instance, sourcePrefab, instance);
-
-        // 新しいプレハブとして保存
-        PrefabUtility.SaveAsPrefabAsset(instance, relativeSavePath);
-
-        // シーンから削除
-        Object.DestroyImmediate(instance);
-
-        // アセットデータベースをリフレッシュ
         AssetDatabase.Refresh();
+        string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
+        var allReports = new List<AnimatorFixReport>();
 
-        Debug.Log($"Components copied from {relativeSourcePath} to {relativeSavePath}");
-        EditorUtility.RevealInFinder(savePath);
+        foreach (string guid in controllerGuids)
+        {
+            string path = AssetDatabase.GUIDToAssetPath(guid);
+            var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
+            if (controller != null)
+            {
+                var reports = AnimatorControllerFixer.DetectAndFixMissingClips(controller);
+                allReports.AddRange(reports);
+            }
+        }
+
+        AnimatorFixResultWindow.ShowReport(allReports, "Animator Fix Results");
     }
 
-    /// <summary>
-    /// 絶対パスをAssetsフォルダ内の相対パスに変換
-    /// </summary>
-    private string GetRelativeAssetPath(string absolutePath)
+    private VersionInfo ExtractVersionFromFolderName(string folderPath)
     {
-        string dataPath = Application.dataPath;
-        if (absolutePath.StartsWith(dataPath))
+        string folderName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        var match = Regex.Match(folderName, @"[_=]([vV]?\d+\.\d+\.\d+)$");
+
+        if (match.Success)
         {
-            return "Assets" + absolutePath.Substring(dataPath.Length);
+            string versionStr = match.Groups[1].Value.ToLower();
+            if (versionStr.StartsWith("v"))
+                versionStr = versionStr.Substring(1);
+
+            var parts = versionStr.Split('.');
+            if (parts.Length == 3 &&
+                int.TryParse(parts[0], out int major) &&
+                int.TryParse(parts[1], out int minor) &&
+                int.TryParse(parts[2], out int patch))
+            {
+                return new VersionInfo(major, minor, patch);
+            }
         }
+
         return null;
     }
 
-    /// <summary>
-    /// ソースGameObjectのコンポーネントをターゲットGameObjectにコピー
-    /// </summary>
-    private void CopyComponents(GameObject source, GameObject target, GameObject sourceRoot, GameObject targetRoot)
+    private void UpdateVersionAfterLoad(VersionInfo loadedVersion)
     {
-        Component[] sourceComponents = source.GetComponents<Component>();
+        int comparison = CompareVersions(loadedVersion, currentVersion);
 
-        foreach (Component sourceComponent in sourceComponents)
+        if (comparison > 0)
         {
-            if (sourceComponent is Transform)
-                continue; // Transformはコピーしない
-
-            System.Type componentType = sourceComponent.GetType();
-
-            // 同じタイプのコンポーネントが既に存在するかチェック
-            Component existingComponent = target.GetComponent(componentType);
-            if (existingComponent != null)
-            {
-                // 既存のコンポーネントのプロパティをソースからコピー（FBX関連参照はスキップ）
-                CopyComponentProperties(sourceComponent, existingComponent, sourceRoot, targetRoot);
-            }
-            else
-            {
-                // 新しいコンポーネントを追加
-                Component newComponent = target.AddComponent(componentType);
-
-                // シリアライズされたプロパティをコピー（FBX関連参照はスキップ）
-                CopyComponentProperties(sourceComponent, newComponent, sourceRoot, targetRoot);
-            }
+            currentVersion = loadedVersion;
+            SaveVersionInfo();
+            Debug.Log($"Version updated to {currentVersion} (loaded version is newer)");
         }
-
-        // 子オブジェクトも再帰的にコピー
-        for (int i = 0; i < source.transform.childCount; i++)
+        else if (comparison < 0)
         {
-            Transform sourceChild = source.transform.GetChild(i);
-            Transform targetChild = target.transform.Find(sourceChild.name);
+            var message = new StringBuilder();
+            message.AppendLine($"警告: 読み込むバージョン {loadedVersion} は現在のバージョン {currentVersion} より古いです。");
+            message.AppendLine();
+            message.AppendLine("読み込んだバージョンを現在のバージョンに設定しますか？");
 
-            if (targetChild == null)
+            if (EditorUtility.DisplayDialog("Version Warning", message.ToString(), "設定する", "キャンセル"))
             {
-                // 新しい子オブジェクトを作成
-                GameObject newChild = new GameObject(sourceChild.name);
-                newChild.transform.SetParent(target.transform);
-                newChild.transform.localPosition = sourceChild.localPosition;
-                newChild.transform.localRotation = sourceChild.localRotation;
-                newChild.transform.localScale = sourceChild.localScale;
-                targetChild = newChild.transform;
+                currentVersion = loadedVersion;
+                SaveVersionInfo();
+                Debug.Log($"Version updated to {currentVersion} (user confirmed)");
             }
-
-            CopyComponents(sourceChild.gameObject, targetChild.gameObject, sourceRoot, targetRoot);
         }
     }
 
-    /// <summary>
-    /// コンポーネントのプロパティをコピー（FBX関連参照はスキップ）
-    /// </summary>
-    private void CopyComponentProperties(Component sourceComponent, Component targetComponent, GameObject sourceRoot, GameObject targetRoot)
+    private int CompareVersions(VersionInfo v1, VersionInfo v2)
     {
-        SerializedObject sourceSO = new SerializedObject(sourceComponent);
-        SerializedObject targetSO = new SerializedObject(targetComponent);
-
-        SerializedProperty sourceProp = sourceSO.GetIterator();
-        while (sourceProp.NextVisible(true))
-        {
-            // FBXに関わる参照をスキップ（materials, bones, meshesなど）
-            if (sourceProp.propertyType == SerializedPropertyType.ObjectReference &&
-                (sourceProp.name == "m_Materials" || sourceProp.name == "bones" ||
-                 sourceProp.name == "m_SharedMaterials" || sourceProp.name == "m_SharedMesh" ||
-                 sourceProp.name == "m_Mesh"))
-            {
-                continue;
-            }
-
-            SerializedProperty targetProp = targetSO.FindProperty(sourceProp.propertyPath);
-            if (targetProp == null || targetProp.propertyType != sourceProp.propertyType)
-                continue;
-
-            if (sourceProp.propertyType == SerializedPropertyType.ObjectReference && sourceProp.objectReferenceValue != null)
-            {
-                Object resolvedRef = ResolveObjectReference(sourceProp.objectReferenceValue, sourceRoot, targetRoot);
-                if (resolvedRef != null)
-                {
-                    targetProp.objectReferenceValue = resolvedRef;
-                    targetSO.ApplyModifiedProperties();
-                    continue;
-                }
-            }
-
-            targetSO.CopyFromSerializedProperty(sourceProp);
-        }
-
-        targetSO.ApplyModifiedProperties();
-    }
-
-    private Object ResolveObjectReference(Object sourceReference, GameObject sourceRoot, GameObject targetRoot)
-    {
-        if (sourceReference == null || sourceRoot == null || targetRoot == null)
-            return sourceReference;
-
-        if (sourceReference is Transform sourceTransform)
-        {
-            return FindCorrespondingTransform(sourceTransform, sourceRoot, targetRoot);
-        }
-
-        if (sourceReference is GameObject sourceGameObject)
-        {
-            var targetTransform = FindCorrespondingTransform(sourceGameObject.transform, sourceRoot, targetRoot);
-            return targetTransform != null ? targetTransform.gameObject : null;
-        }
-
-        if (sourceReference is Component sourceComponent)
-        {
-            var targetTransform = FindCorrespondingTransform(sourceComponent.transform, sourceRoot, targetRoot);
-            if (targetTransform == null)
-                return null;
-            return targetTransform.GetComponent(sourceComponent.GetType());
-        }
-
-        return sourceReference;
-    }
-
-    private Transform FindCorrespondingTransform(Transform sourceTransform, GameObject sourceRoot, GameObject targetRoot)
-    {
-        string relativePath = GetRelativeTransformPath(sourceTransform, sourceRoot.transform);
-        if (relativePath == null)
-            return null;
-
-        if (string.IsNullOrEmpty(relativePath))
-            return targetRoot.transform;
-
-        return targetRoot.transform.Find(relativePath);
-    }
-
-    private string GetRelativeTransformPath(Transform transform, Transform root)
-    {
-        if (transform == root)
-            return string.Empty;
-
-        var segments = new List<string>();
-        Transform current = transform;
-        while (current != null && current != root)
-        {
-            segments.Insert(0, current.name);
-            current = current.parent;
-        }
-
-        return current == root ? string.Join("/", segments) : null;
+        if (v1.major != v2.major)
+            return v1.major.CompareTo(v2.major);
+        if (v1.minor != v2.minor)
+            return v1.minor.CompareTo(v2.minor);
+        return v1.patch.CompareTo(v2.patch);
     }
 }
