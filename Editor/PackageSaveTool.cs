@@ -283,9 +283,73 @@ namespace PackageSaveTool
 
             string saveFolder = $"{sanitizedAuthor}_{currentVersion}";
             string savePath = Path.Combine(destinationPath, saveFolder);
-            Directory.CreateDirectory(savePath);
 
-            var manifestRelativePaths = new List<string>();
+            var manifestRelativePaths = GetPackageRelativePaths(targetAssetPaths);
+            DetailedFolderDiffInfo diffInfo = GetSavePackageDifferences(savePath, manifestRelativePaths);
+
+            if (diffInfo.FileDetails.Count > 0)
+            {
+                DiffResultWindow.ShowWindow(diffInfo, Application.dataPath, savePath, () =>
+                {
+                    ExecuteSaveSelectedPackage(savePath, targetAssetPaths, manifestRelativePaths);
+                }, "保存を実行（上書き）");
+                return;
+            }
+
+            ExecuteSaveSelectedPackage(savePath, targetAssetPaths, manifestRelativePaths);
+        }
+
+        private List<string> GetPackageRelativePaths(IEnumerable<string> targetAssetPaths)
+        {
+            return targetAssetPaths
+                .Select(GetPathRelativeToAssets)
+                .Where(relPath => !string.IsNullOrEmpty(relPath))
+                .Distinct()
+                .OrderBy(relPath => relPath)
+                .ToList();
+        }
+
+        private DetailedFolderDiffInfo GetSavePackageDifferences(string savePath, IEnumerable<string> manifestRelativePaths)
+        {
+            var result = new DetailedFolderDiffInfo();
+
+            if (!Directory.Exists(savePath))
+                return result;
+
+            foreach (var relPath in manifestRelativePaths)
+            {
+                string sysSourcePath = Path.Combine(Application.dataPath, relPath);
+                string sysDestPath = Path.Combine(savePath, relPath.Replace('/', Path.DirectorySeparatorChar));
+
+                if (!File.Exists(sysSourcePath))
+                    continue;
+
+                var fileDetail = new FileDiffDetail { RelativePath = relPath };
+
+                if (!File.Exists(sysDestPath))
+                {
+                    fileDetail.Status = "新規追加";
+                    result.FileDetails.Add(fileDetail);
+                }
+                else if (!FileHashEquals(sysSourcePath, sysDestPath))
+                {
+                    fileDetail.Status = "変更あり";
+
+                    if (IsAssetFile(sysSourcePath))
+                    {
+                        fileDetail.PropertyDiffs = CompareProperties(sysDestPath, sysSourcePath);
+                    }
+
+                    result.FileDetails.Add(fileDetail);
+                }
+            }
+
+            return result;
+        }
+
+        private void ExecuteSaveSelectedPackage(string savePath, IEnumerable<string> targetAssetPaths, IEnumerable<string> manifestRelativePaths)
+        {
+            Directory.CreateDirectory(savePath);
 
             foreach (var assetPath in targetAssetPaths)
             {
@@ -302,7 +366,6 @@ namespace PackageSaveTool
                         Directory.CreateDirectory(destDir);
 
                     File.Copy(sysSourcePath, sysDestPath, true);
-                    manifestRelativePaths.Add(relPath);
 
                     string sysMetaSource = sysSourcePath + ".meta";
                     if (File.Exists(sysMetaSource))
@@ -312,7 +375,7 @@ namespace PackageSaveTool
                 }
             }
 
-            var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.Distinct().OrderBy(p => p).ToArray() };
+            var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.ToArray() };
             string manifestPath = Path.Combine(savePath, ManifestFileName);
             File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true));
 
