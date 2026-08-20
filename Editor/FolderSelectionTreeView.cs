@@ -111,7 +111,7 @@ namespace PackageSaveTool
             }
 
             bool anyChecked = item.isChecked;
-            bool anyUnchecked = !item.isChecked;
+            bool anyUnchecked = false;
 
             foreach (TreeViewItem child in item.children)
             {
