@@ -14,14 +14,21 @@ namespace PackageSaveTool
         private Vector2 scrollPosition;
         private Dictionary<string, bool> foldoutStates = new Dictionary<string, bool>();
         private Action onConfirmCallback;
+        private string confirmButtonLabel = "読み込みを実行（上書き/統合）";
 
         public static void ShowWindow(DetailedFolderDiffInfo diff, string source, string dest, Action onConfirm)
+        {
+            ShowWindow(diff, source, dest, onConfirm, "読み込みを実行（上書き/統合）");
+        }
+
+        public static void ShowWindow(DetailedFolderDiffInfo diff, string source, string dest, Action onConfirm, string confirmLabel)
         {
             var win = GetWindow<DiffResultWindow>("Folder Diff Result");
             win.diffInfo = diff;
             win.sourcePath = source;
             win.destPath = dest;
             win.onConfirmCallback = onConfirm;
+            win.confirmButtonLabel = string.IsNullOrEmpty(confirmLabel) ? "実行" : confirmLabel;
             win.minSize = new Vector2(500, 400);
             win.Show();
         }
@@ -91,7 +98,7 @@ namespace PackageSaveTool
 
             EditorGUILayout.Space();
             EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("読み込みを実行（上書き/統合）", GUILayout.Height(35)))
+            if (GUILayout.Button(confirmButtonLabel, GUILayout.Height(35)))
             {
                 onConfirmCallback?.Invoke();
                 Close();
