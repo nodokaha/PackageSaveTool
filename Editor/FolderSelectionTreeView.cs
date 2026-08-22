@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -12,9 +13,10 @@ namespace PackageSaveTool
     /// </summary>
     public class FolderTreeItem : TreeViewItem
     {
-        public bool isChecked = false;
+        public bool isChecked;
+        public bool isMixed;
         public string fullPath = "";
-        public bool isFolder = false;
+        public bool isFolder;
 
         public FolderTreeItem(int id, int depth, string displayName, string fullPath, bool isFolder)
             : base(id, depth, displayName)
@@ -29,7 +31,7 @@ namespace PackageSaveTool
     /// </summary>
     public class FolderSelectionTreeView : TreeView
     {
-        private Dictionary<int, FolderTreeItem> itemDict = new Dictionary<int, FolderTreeItem>();
+        private readonly Dictionary<int, FolderTreeItem> itemDict = new Dictionary<int, FolderTreeItem>();
         private int nextId = 1;
 
         public FolderSelectionTreeView(TreeViewState state) : base(state)
@@ -43,11 +45,9 @@ namespace PackageSaveTool
             itemDict.Clear();
             nextId = 1;
 
-            string assetsPath = "Assets";
+            const string assetsPath = "Assets";
             if (Directory.Exists(assetsPath))
-            {
                 BuildTreeRecursive(assetsPath, root, 0);
-            }
 
             return root;
         }
@@ -61,27 +61,19 @@ namespace PackageSaveTool
                 parent.AddChild(item);
                 nextId++;
 
-                var subDirs = Directory.GetDirectories(folderPath).OrderBy(p => Path.GetFileName(p));
-                foreach (var dir in subDirs)
+                foreach (var dir in Directory.GetDirectories(folderPath).OrderBy(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase))
                 {
                     string dirName = Path.GetFileName(dir);
                     if (dirName.StartsWith("."))
                         continue;
 
-                    if (dirName.Equals("Editor", System.StringComparison.OrdinalIgnoreCase) ||
-                        dirName.Equals("XR", System.StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
                     BuildTreeRecursive(dir, item, depth + 1);
                 }
 
-                var files = Directory.GetFiles(folderPath).OrderBy(p => Path.GetFileName(p));
-                foreach (var file in files)
+                foreach (var file in Directory.GetFiles(folderPath).OrderBy(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase))
                 {
                     string fileName = Path.GetFileName(file);
-                    if (fileName.EndsWith(".meta"))
+                    if (fileName.StartsWith(".") || fileName.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
                         continue;
 
                     var fileItem = new FolderTreeItem(nextId, depth + 1, fileName, file, false);
@@ -90,9 +82,9 @@ namespace PackageSaveTool
                     nextId++;
                 }
             }
-            catch
+            catch (Exception e)
             {
-                // アクセス権エラー等はスキップ
+                Debug.LogWarning($"[PackageSaveTool] Skipped folder '{folderPath}': {e.Message}");
             }
         }
 
@@ -103,41 +95,11 @@ namespace PackageSaveTool
             Mixed
         }
 
-        private CheckState GetCheckState(FolderTreeItem item)
+        private static CheckState GetCheckState(FolderTreeItem item)
         {
-            if (!item.hasChildren || item.children == null || item.children.Count == 0)
-            {
-                return item.isChecked ? CheckState.Checked : CheckState.Unchecked;
-            }
-
-            bool anyChecked = item.isChecked;
-            bool anyUnchecked = false;
-
-            foreach (TreeViewItem child in item.children)
-            {
-                if (child is FolderTreeItem folderChild)
-                {
-                    var childState = GetCheckState(folderChild);
-                    if (childState == CheckState.Mixed)
-                    {
-                        anyChecked = true;
-                        anyUnchecked = true;
-                    }
-                    else if (childState == CheckState.Checked)
-                    {
-                        anyChecked = true;
-                    }
-                    else
-                    {
-                        anyUnchecked = true;
-                    }
-                }
-            }
-
-            if (anyChecked && anyUnchecked)
+            if (item.isMixed)
                 return CheckState.Mixed;
-
-            return anyChecked ? CheckState.Checked : CheckState.Unchecked;
+            return item.isChecked ? CheckState.Checked : CheckState.Unchecked;
         }
 
         protected override void RowGUI(RowGUIArgs args)
@@ -157,13 +119,21 @@ namespace PackageSaveTool
             bool displayValue = state == CheckState.Checked;
 
             bool previousMixedValue = EditorGUI.showMixedValue;
-            EditorGUI.showMixedValue = (state == CheckState.Mixed);
-            bool newValue = EditorGUI.Toggle(toggleRect, displayValue);
-            EditorGUI.showMixedValue = previousMixedValue;
+            EditorGUI.showMixedValue = state == CheckState.Mixed;
+            bool newValue;
+            try
+            {
+                newValue = EditorGUI.Toggle(toggleRect, displayValue);
+            }
+            finally
+            {
+                EditorGUI.showMixedValue = previousMixedValue;
+            }
 
             if (newValue != displayValue)
             {
                 SetCheckedRecursively(item, newValue);
+                UpdateAncestorStates(item);
                 Repaint();
             }
 
@@ -175,38 +145,95 @@ namespace PackageSaveTool
             base.RowGUI(newArgs);
         }
 
-        private void SetCheckedRecursively(FolderTreeItem item, bool value)
+        private static void SetCheckedRecursively(FolderTreeItem item, bool value)
         {
             item.isChecked = value;
-            if (item.hasChildren && item.children != null)
+            item.isMixed = false;
+            if (!item.hasChildren || item.children == null)
+                return;
+
+            foreach (TreeViewItem child in item.children)
             {
-                foreach (TreeViewItem child in item.children)
+                if (child is FolderTreeItem folderChild)
+                    SetCheckedRecursively(folderChild, value);
+            }
+        }
+
+        private static void UpdateAncestorStates(FolderTreeItem item)
+        {
+            var parent = item.parent as FolderTreeItem;
+            while (parent != null)
+            {
+                ComputeFolderState(parent);
+                parent = parent.parent as FolderTreeItem;
+            }
+        }
+
+        private static void ComputeFolderState(FolderTreeItem folder)
+        {
+            if (!folder.hasChildren || folder.children == null || folder.children.Count == 0)
+            {
+                folder.isMixed = false;
+                return;
+            }
+
+            bool anyChecked = false;
+            bool anyUnchecked = false;
+            foreach (TreeViewItem child in folder.children)
+            {
+                if (!(child is FolderTreeItem folderChild))
+                    continue;
+
+                if (folderChild.isMixed)
                 {
-                    if (child is FolderTreeItem folderChild)
-                    {
-                        SetCheckedRecursively(folderChild, value);
-                    }
+                    anyChecked = true;
+                    anyUnchecked = true;
+                }
+                else if (folderChild.isChecked)
+                {
+                    anyChecked = true;
+                }
+                else
+                {
+                    anyUnchecked = true;
                 }
             }
+
+            folder.isMixed = anyChecked && anyUnchecked;
+            folder.isChecked = anyChecked && !anyUnchecked;
         }
 
         public List<string> GetSelectedPaths()
         {
             var result = new List<string>();
-            foreach (var item in itemDict.Values)
-            {
-                if (item.isChecked)
-                    result.Add(item.fullPath);
-            }
+            if (rootItem != null)
+                CollectCheckedTopLevel(rootItem, result);
             return result;
         }
 
-        public void SetAllChecked(bool checked_)
+        private static void CollectCheckedTopLevel(TreeViewItem item, List<string> result)
+        {
+            if (item is FolderTreeItem folder && folder.id != 0 && folder.isChecked && !folder.isMixed)
+            {
+                result.Add(folder.fullPath);
+                return;
+            }
+
+            if (!item.hasChildren || item.children == null)
+                return;
+
+            foreach (TreeViewItem child in item.children)
+                CollectCheckedTopLevel(child, result);
+        }
+
+        public void SetAllChecked(bool checkedValue)
         {
             foreach (var item in itemDict.Values)
             {
-                item.isChecked = checked_;
+                item.isChecked = checkedValue;
+                item.isMixed = false;
             }
+
             Repaint();
         }
     }

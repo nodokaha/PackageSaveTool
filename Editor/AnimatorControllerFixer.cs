@@ -14,212 +14,237 @@ namespace PackageSaveTool
         public static List<AnimatorFixReport> ScanMissingClips(AnimatorController controller)
         {
             var reports = new List<AnimatorFixReport>();
-            if (controller == null) return reports;
+            if (controller == null)
+                return reports;
 
-            string controllerPath = AssetDatabase.GetAssetPath(controller);
-
-            foreach (var layer in controller.layers)
-            {
-                ScanStateMachine(layer.stateMachine, controller.name, controllerPath, reports);
-            }
-
+            WalkController(controller, null, reports, fix: false);
             return reports;
         }
 
-        private static void ScanStateMachine(AnimatorStateMachine stateMachine, string controllerName, string controllerPath, List<AnimatorFixReport> reports)
-        {
-            foreach (var childState in stateMachine.states)
-            {
-                var state = childState.state;
-                if (state == null) continue;
-
-                if (state.motion is BlendTree blendTree)
-                {
-                    ScanBlendTree(blendTree, controllerName, controllerPath, reports);
-                }
-                else if (IsMotionMissing(state, out _))
-                {
-                    reports.Add(new AnimatorFixReport
-                    {
-                        ControllerName = controllerName,
-                        ControllerPath = controllerPath,
-                        StateName = state.name,
-                        ReassignedClipName = "",
-                        ClipPath = "",
-                        IsFixed = false
-                    });
-                }
-            }
-
-            foreach (var subMachine in stateMachine.stateMachines)
-            {
-                ScanStateMachine(subMachine.stateMachine, controllerName, controllerPath, reports);
-            }
-        }
-
-        private static void ScanBlendTree(BlendTree blendTree, string controllerName, string controllerPath, List<AnimatorFixReport> reports)
-        {
-            foreach (var child in blendTree.children)
-            {
-                if (child.motion is BlendTree subTree)
-                {
-                    ScanBlendTree(subTree, controllerName, controllerPath, reports);
-                }
-                else if (child.motion == null)
-                {
-                    reports.Add(new AnimatorFixReport
-                    {
-                        ControllerName = controllerName,
-                        ControllerPath = controllerPath,
-                        StateName = $"BlendTree ({blendTree.name})",
-                        ReassignedClipName = "",
-                        ClipPath = "",
-                        IsFixed = false
-                    });
-                }
-            }
-        }
-
-        public static List<AnimatorFixReport> DetectAndFixMissingClips(AnimatorController controller)
+        public static List<AnimatorFixReport> FixMissingClips(AnimatorController controller)
         {
             var reports = new List<AnimatorFixReport>();
-            if (controller == null) return reports;
+            if (controller == null)
+                return reports;
 
-            string controllerPath = AssetDatabase.GetAssetPath(controller);
-            var allClips = FindAllAnimationClipsInProject();
-
-            foreach (var layer in controller.layers)
-            {
-                FixStateMachine(layer.stateMachine, controller.name, controllerPath, allClips, reports);
-            }
-
-            if (reports.Count > 0)
-            {
+            var clipCache = FindAllAnimationClipsInProject();
+            bool modified = WalkController(controller, clipCache, reports, fix: true);
+            if (modified)
                 EditorUtility.SetDirty(controller);
-                AssetDatabase.SaveAssets();
-                Debug.Log($"[AnimatorFixer] '{controller.name}' 内の欠落したアニメーション参照を {reports.Count} 件自動修復しました。");
-            }
 
             return reports;
         }
 
-        private static void FixStateMachine(
+        private static bool WalkController(
+            AnimatorController controller,
+            Dictionary<string, List<(AnimationClip clip, string path)>> clipCache,
+            List<AnimatorFixReport> reports,
+            bool fix)
+        {
+            bool modified = false;
+            string controllerPath = AssetDatabase.GetAssetPath(controller);
+
+            foreach (var layer in controller.layers)
+            {
+                if (layer.syncedLayerIndex >= 0 || layer.stateMachine == null)
+                    continue;
+
+                modified |= WalkStateMachine(layer.stateMachine, controller.name, controllerPath, clipCache, reports, fix);
+            }
+
+            return modified;
+        }
+
+        private static bool WalkStateMachine(
             AnimatorStateMachine stateMachine,
             string controllerName,
             string controllerPath,
-            Dictionary<string, (AnimationClip clip, string path)> clipCache,
-            List<AnimatorFixReport> reports)
+            Dictionary<string, List<(AnimationClip clip, string path)>> clipCache,
+            List<AnimatorFixReport> reports,
+            bool fix)
         {
+            if (stateMachine == null)
+                return false;
+
+            bool modified = false;
+
             foreach (var childState in stateMachine.states)
             {
                 var state = childState.state;
-                if (state == null) continue;
+                if (state == null)
+                    continue;
 
                 if (state.motion is BlendTree blendTree)
                 {
-                    FixBlendTree(blendTree, controllerName, controllerPath, clipCache, reports);
+                    WalkBlendTree(blendTree, controllerName, controllerPath, reports);
+                    continue;
                 }
-                else if (IsMotionMissing(state, out string missingClipName))
-                {
-                    if (!string.IsNullOrEmpty(missingClipName) && clipCache.TryGetValue(missingClipName, out var found))
-                    {
-                        state.motion = found.clip;
-                        reports.Add(new AnimatorFixReport
-                        {
-                            ControllerName = controllerName,
-                            ControllerPath = controllerPath,
-                            StateName = state.name,
-                            ReassignedClipName = found.clip.name,
-                            ClipPath = found.path,
-                            IsFixed = true
-                        });
-                    }
-                }
+
+                if (!IsMotionMissing(state, out string missingClipName))
+                    continue;
+
+                if (fix)
+                    modified |= TryAssignClip(state, missingClipName, controllerName, controllerPath, clipCache, reports);
+                else
+                    reports.Add(CreateReport(controllerName, controllerPath, state.name, false));
             }
 
             foreach (var subMachine in stateMachine.stateMachines)
             {
-                FixStateMachine(subMachine.stateMachine, controllerName, controllerPath, clipCache, reports);
+                modified |= WalkStateMachine(subMachine.stateMachine, controllerName, controllerPath, clipCache, reports, fix);
             }
+
+            return modified;
         }
 
-        private static void FixBlendTree(
+        private static void WalkBlendTree(
             BlendTree blendTree,
             string controllerName,
             string controllerPath,
-            Dictionary<string, (AnimationClip clip, string path)> clipCache,
             List<AnimatorFixReport> reports)
         {
-            var children = blendTree.children;
-            bool isModified = false;
+            if (blendTree == null)
+                return;
 
-            for (int i = 0; i < children.Length; i++)
+            SerializedObject so = new SerializedObject(blendTree);
+            SerializedProperty childrenProp = so.FindProperty("m_Childs") ?? so.FindProperty("m_Children");
+            if (childrenProp == null || !childrenProp.isArray)
+                return;
+
+            for (int i = 0; i < childrenProp.arraySize; i++)
             {
-                var child = children[i];
-                if (child.motion is BlendTree subTree)
-                {
-                    FixBlendTree(subTree, controllerName, controllerPath, clipCache, reports);
-                }
-                else if (child.motion == null)
-                {
-                    string searchKey = blendTree.name;
-                    if (clipCache.TryGetValue(searchKey, out var found))
-                    {
-                        child.motion = found.clip;
-                        children[i] = child;
-                        isModified = true;
+                SerializedProperty childProp = childrenProp.GetArrayElementAtIndex(i);
+                SerializedProperty motionProp = childProp.FindPropertyRelative("m_Motion");
+                if (motionProp == null)
+                    continue;
 
-                        reports.Add(new AnimatorFixReport
-                        {
-                            ControllerName = controllerName,
-                            ControllerPath = controllerPath,
-                            StateName = $"BlendTree ({blendTree.name})",
-                            ReassignedClipName = found.clip.name,
-                            ClipPath = found.path,
-                            IsFixed = true
-                        });
-                    }
+                var motion = motionProp.objectReferenceValue;
+                if (motion is BlendTree subTree)
+                {
+                    WalkBlendTree(subTree, controllerName, controllerPath, reports);
+                    continue;
                 }
+
+                if (!IsSerializedReferenceMissing(motionProp))
+                    continue;
+
+                reports.Add(new AnimatorFixReport
+                {
+                    ControllerName = controllerName,
+                    ControllerPath = controllerPath,
+                    StateName = $"BlendTree ({blendTree.name}) [{i}]",
+                    ReassignedClipName = "",
+                    ClipPath = "",
+                    IsFixed = false,
+                    Note = "BlendTree の子モーションが Missing です。空スロットは無視し、名前推定による自動修復は行いません。"
+                });
+            }
+        }
+
+        private static bool TryAssignClip(
+            AnimatorState state,
+            string missingClipName,
+            string controllerName,
+            string controllerPath,
+            Dictionary<string, List<(AnimationClip clip, string path)>> clipCache,
+            List<AnimatorFixReport> reports)
+        {
+            if (string.IsNullOrEmpty(missingClipName) ||
+                clipCache == null ||
+                !clipCache.TryGetValue(missingClipName, out var matches) ||
+                matches.Count == 0)
+            {
+                reports.Add(CreateReport(controllerName, controllerPath, state.name, false, note: "同名の AnimationClip が見つかりませんでした。"));
+                return false;
             }
 
-            if (isModified)
+            if (matches.Count > 1)
             {
-                blendTree.children = children;
+                reports.Add(CreateReport(
+                    controllerName,
+                    controllerPath,
+                    state.name,
+                    false,
+                    note: $"同名クリップが {matches.Count} 件あり、自動修復できませんでした。"));
+                return false;
             }
+
+            var found = matches[0];
+            state.motion = found.clip;
+            reports.Add(new AnimatorFixReport
+            {
+                ControllerName = controllerName,
+                ControllerPath = controllerPath,
+                StateName = state.name,
+                ReassignedClipName = found.clip.name,
+                ClipPath = found.path,
+                IsFixed = true
+            });
+            return true;
+        }
+
+        private static AnimatorFixReport CreateReport(
+            string controllerName,
+            string controllerPath,
+            string stateName,
+            bool isFixed,
+            string clipName = "",
+            string clipPath = "",
+            string note = "")
+        {
+            return new AnimatorFixReport
+            {
+                ControllerName = controllerName,
+                ControllerPath = controllerPath,
+                StateName = stateName,
+                ReassignedClipName = clipName,
+                ClipPath = clipPath,
+                IsFixed = isFixed,
+                Note = note
+            };
         }
 
         private static bool IsMotionMissing(AnimatorState state, out string originalName)
         {
             originalName = string.Empty;
+            if (state.motion != null)
+                return false;
 
-            if (state.motion == null)
-            {
-                SerializedObject so = new SerializedObject(state);
-                SerializedProperty motionProp = so.FindProperty("m_Motion");
+            SerializedObject so = new SerializedObject(state);
+            SerializedProperty motionProp = so.FindProperty("m_Motion");
+            if (!IsSerializedReferenceMissing(motionProp))
+                return false;
 
-                if (motionProp != null && motionProp.objectReferenceInstanceIDValue != 0 && motionProp.objectReferenceValue == null)
-                {
-                    originalName = state.name;
-                    return true;
-                }
-            }
-
-            return false;
+            originalName = state.name;
+            return true;
         }
 
-        private static Dictionary<string, (AnimationClip clip, string path)> FindAllAnimationClipsInProject()
+        private static bool IsSerializedReferenceMissing(SerializedProperty motionProp)
         {
-            var dict = new Dictionary<string, (AnimationClip, string)>(StringComparer.OrdinalIgnoreCase);
+            return motionProp != null &&
+                   motionProp.objectReferenceInstanceIDValue != 0 &&
+                   motionProp.objectReferenceValue == null;
+        }
+
+        private static Dictionary<string, List<(AnimationClip clip, string path)>> FindAllAnimationClipsInProject()
+        {
+            var dict = new Dictionary<string, List<(AnimationClip, string)>>(StringComparer.OrdinalIgnoreCase);
             string[] guids = AssetDatabase.FindAssets("t:AnimationClip");
 
             foreach (var guid in guids)
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
                 AnimationClip clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
-                if (clip != null && !dict.ContainsKey(clip.name))
+                if (clip == null)
+                    continue;
+
+                if (!dict.TryGetValue(clip.name, out var list))
                 {
-                    dict.Add(clip.name, (clip, path));
+                    list = new List<(AnimationClip, string)>();
+                    dict.Add(clip.name, list);
                 }
+
+                list.Add((clip, path));
             }
 
             return dict;

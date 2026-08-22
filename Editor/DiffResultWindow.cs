@@ -1,11 +1,9 @@
-using System;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
 namespace PackageSaveTool
 {
-    #region 差分結果表示ウィンドウ
     public class DiffResultWindow : EditorWindow
     {
         private DetailedFolderDiffInfo diffInfo;
@@ -13,24 +11,27 @@ namespace PackageSaveTool
         private string destPath;
         private Vector2 scrollPosition;
         private Dictionary<string, bool> foldoutStates = new Dictionary<string, bool>();
-        private Action onConfirmCallback;
         private string confirmButtonLabel = "読み込みを実行（上書き/統合）";
+        private ModalState modalState;
 
-        public static void ShowWindow(DetailedFolderDiffInfo diff, string source, string dest, Action onConfirm)
+        private sealed class ModalState
         {
-            ShowWindow(diff, source, dest, onConfirm, "読み込みを実行（上書き/統合）");
+            public bool Confirmed;
         }
 
-        public static void ShowWindow(DetailedFolderDiffInfo diff, string source, string dest, Action onConfirm, string confirmLabel)
+        public static bool Confirm(DetailedFolderDiffInfo diff, string source, string dest, string confirmLabel)
         {
-            var win = GetWindow<DiffResultWindow>("Folder Diff Result");
+            var state = new ModalState();
+            var win = CreateInstance<DiffResultWindow>();
+            win.titleContent = new GUIContent("Folder Diff Result");
             win.diffInfo = diff;
             win.sourcePath = source;
             win.destPath = dest;
-            win.onConfirmCallback = onConfirm;
             win.confirmButtonLabel = string.IsNullOrEmpty(confirmLabel) ? "実行" : confirmLabel;
             win.minSize = new Vector2(500, 400);
-            win.Show();
+            win.modalState = state;
+            win.ShowModal();
+            return state.Confirmed;
         }
 
         private void OnGUI()
@@ -38,6 +39,7 @@ namespace PackageSaveTool
             if (diffInfo == null || diffInfo.FileDetails == null)
             {
                 EditorGUILayout.HelpBox("差分データがありません。", MessageType.Info);
+                DrawButtons();
                 return;
             }
 
@@ -45,6 +47,7 @@ namespace PackageSaveTool
             GUILayout.Label("フォルダ変更差分結果", EditorStyles.boldLabel);
             EditorGUILayout.LabelField("比較元 (New):", sourcePath, EditorStyles.miniLabel);
             EditorGUILayout.LabelField("比較先 (Old):", destPath, EditorStyles.miniLabel);
+            EditorGUILayout.HelpBox($"差分 {diffInfo.FileDetails.Count} 件。実行すると比較先へ反映されます。", MessageType.Info);
             EditorGUILayout.Space();
 
             scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
@@ -54,11 +57,17 @@ namespace PackageSaveTool
                 Color defaultColor = GUI.color;
                 switch (detail.Status)
                 {
-                    case "新規追加":
-                    case "追加":     GUI.color = Color.green; break;
-                    case "削除":     GUI.color = new Color(1f, 0.4f, 0.4f); break;
-                    case "変更あり":
-                    case "パラメータ変更": GUI.color = Color.yellow; break;
+                    case DiffStatus.Added:
+                    case "追加":
+                        GUI.color = Color.green;
+                        break;
+                    case DiffStatus.Removed:
+                        GUI.color = new Color(1f, 0.4f, 0.4f);
+                        break;
+                    case DiffStatus.Modified:
+                    case "パラメータ変更":
+                        GUI.color = Color.yellow;
+                        break;
                 }
 
                 EditorGUILayout.BeginVertical("box");
@@ -95,12 +104,17 @@ namespace PackageSaveTool
             }
 
             EditorGUILayout.EndScrollView();
+            DrawButtons();
+        }
 
+        private void DrawButtons()
+        {
             EditorGUILayout.Space();
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button(confirmButtonLabel, GUILayout.Height(35)))
             {
-                onConfirmCallback?.Invoke();
+                if (modalState != null)
+                    modalState.Confirmed = true;
                 Close();
             }
             if (GUILayout.Button("キャンセル", GUILayout.Height(35)))
@@ -111,5 +125,4 @@ namespace PackageSaveTool
             EditorGUILayout.Space(4);
         }
     }
-    #endregion
 }

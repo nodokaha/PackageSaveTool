@@ -1,9 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.Animations;
 using UnityEngine;
@@ -19,7 +18,7 @@ namespace PackageSaveTool
         private Vector2 scrollPosition;
         private VersionInfo currentVersion = new VersionInfo(1, 0, 0);
         private string authorName = "Unknown";
-        private bool integrationMode = false;
+        private bool integrationMode;
 
         [MenuItem("Tools/Package Save Tool")]
         public static void ShowWindow()
@@ -29,7 +28,7 @@ namespace PackageSaveTool
 
         private void OnEnable()
         {
-            LoadVersionInfo();
+            currentVersion = PackageVersionStore.Load();
             authorName = EditorPrefs.GetString(AuthorEditorPrefKey, "Unknown");
             if (string.IsNullOrWhiteSpace(authorName))
                 authorName = "Unknown";
@@ -66,55 +65,41 @@ namespace PackageSaveTool
                 "統合モード（マージ：既存フォルダを削除せず、追加・上書きのみ行う）",
                 integrationMode);
             if (EditorGUI.EndChangeCheck())
-            {
                 EditorPrefs.SetBool(IntegrationModeEditorPrefKey, integrationMode);
-            }
 
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Increment Version", GUILayout.Height(35)))
-            {
                 ShowVersionIncrementDialog();
-            }
 
             EditorGUILayout.Space();
             EditorGUILayout.Separator();
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Save Folder (With Version Control & Dependencies)", GUILayout.Height(40)))
-            {
                 FolderSelectionWindow.ShowWindow(OnFoldersSelected);
-            }
 
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Load Folder (Import & Fix References)", GUILayout.Height(40)))
-            {
                 LoadFolderWithReferenceFixing();
-            }
 
             EditorGUILayout.Space();
             EditorGUILayout.Separator();
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Copy Components from Prefab to FBX", GUILayout.Height(35)))
-            {
                 CopyComponentsFromPrefabToFBX();
-            }
 
             EditorGUILayout.Space();
 
             if (GUILayout.Button("1. Scan Missing Animation Clips", GUILayout.Height(30)))
-            {
-                ScanAllAnimatorControllers();
-            }
+                ScanAnimatorControllers();
 
             EditorGUILayout.Space();
 
             if (GUILayout.Button("2. Fix Animator Controllers Missing Clips", GUILayout.Height(30)))
-            {
-                FixAllAnimatorControllers();
-            }
+                FixAnimatorControllers();
 
             EditorGUILayout.Space();
             EditorGUILayout.HelpBox(
@@ -130,14 +115,14 @@ namespace PackageSaveTool
         #region バージョン管理
         private void ShowVersionIncrementDialog()
         {
-            var buttons = new[] { "破壊的変更（メジャー版UP v1.0.0→v2.0.0）", "互換性あり（マイナー版UP v1.0.0→v1.1.0）", "キャンセル" };
-
             int result = EditorUtility.DisplayDialogComplex(
                 "バージョン増加方法を選択",
                 "このバージョンは破壊的な変更を含みますか？\n\n" +
                 "【破壊的変更】\n既存のデータ/設定と互換性がない場合（メジャーバージョン UP）\n\n" +
                 "【互換性あり】\n機能追加だが既存との互換性がある場合（マイナーバージョン UP）",
-                buttons[0], buttons[2], buttons[1]
+                "破壊的変更（メジャー版UP v1.0.0→v2.0.0）",
+                "キャンセル",
+                "互換性あり（マイナー版UP v1.0.0→v1.1.0）"
             );
 
             if (result == 0)
@@ -150,59 +135,22 @@ namespace PackageSaveTool
                 currentVersion.IncrementMinor();
                 Debug.Log($"Version incremented to {currentVersion} (Compatible - Minor)");
             }
-
-            SaveVersionInfo();
-        }
-
-        private void SaveVersionInfo()
-        {
-            string versionFile = Path.Combine(Application.persistentDataPath, "version_info.json");
-            string jsonData = JsonUtility.ToJson(currentVersion, true);
-            File.WriteAllText(versionFile, jsonData);
-        }
-
-        private void LoadVersionInfo()
-        {
-            string versionFile = Path.Combine(Application.persistentDataPath, "version_info.json");
-            if (File.Exists(versionFile))
+            else
             {
-                string jsonData = File.ReadAllText(versionFile);
-                currentVersion = JsonUtility.FromJson<VersionInfo>(jsonData) ?? new VersionInfo(1, 0, 0);
-            }
-        }
-
-        private VersionInfo ExtractVersionFromFolderName(string folderPath)
-        {
-            string folderName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            var match = Regex.Match(folderName, @"[_=]([vV]?\d+\.\d+\.\d+)$");
-
-            if (match.Success)
-            {
-                string versionStr = match.Groups[1].Value.ToLower();
-                if (versionStr.StartsWith("v"))
-                    versionStr = versionStr.Substring(1);
-
-                var parts = versionStr.Split('.');
-                if (parts.Length == 3 &&
-                    int.TryParse(parts[0], out int major) &&
-                    int.TryParse(parts[1], out int minor) &&
-                    int.TryParse(parts[2], out int patch))
-                {
-                    return new VersionInfo(major, minor, patch);
-                }
+                return;
             }
 
-            return null;
+            PackageVersionStore.Save(currentVersion);
         }
 
         private void UpdateVersionAfterLoad(VersionInfo loadedVersion)
         {
-            int comparison = CompareVersions(loadedVersion, currentVersion);
+            int comparison = loadedVersion.CompareTo(currentVersion);
 
             if (comparison > 0)
             {
-                currentVersion = loadedVersion;
-                SaveVersionInfo();
+                currentVersion = loadedVersion.Clone();
+                PackageVersionStore.Save(currentVersion);
                 Debug.Log($"Version updated to {currentVersion} (loaded version is newer)");
             }
             else if (comparison < 0)
@@ -214,20 +162,11 @@ namespace PackageSaveTool
 
                 if (EditorUtility.DisplayDialog("Version Warning", message.ToString(), "設定する", "キャンセル"))
                 {
-                    currentVersion = loadedVersion;
-                    SaveVersionInfo();
+                    currentVersion = loadedVersion.Clone();
+                    PackageVersionStore.Save(currentVersion);
                     Debug.Log($"Version updated to {currentVersion} (user confirmed)");
                 }
             }
-        }
-
-        private int CompareVersions(VersionInfo v1, VersionInfo v2)
-        {
-            if (v1.major != v2.major)
-                return v1.major.CompareTo(v2.major);
-            if (v1.minor != v2.minor)
-                return v1.minor.CompareTo(v2.minor);
-            return v1.patch.CompareTo(v2.patch);
         }
         #endregion
 
@@ -235,28 +174,64 @@ namespace PackageSaveTool
         private void OnFoldersSelected(List<string> selectedPaths)
         {
             string destinationPath = EditorUtility.OpenFolderPanel("Select Save Destination", "", "");
-
             if (string.IsNullOrEmpty(destinationPath))
             {
                 Debug.Log("Destination selection cancelled.");
                 return;
             }
 
-            selectedPaths = FilterTopLevelSelections(selectedPaths);
-            HashSet<string> targetAssetPaths = new HashSet<string>();
+            try
+            {
+                selectedPaths = PathUtil.FilterTopLevelSelections(selectedPaths);
+                var targetAssetPaths = CollectTargetAssetPaths(selectedPaths);
+                if (targetAssetPaths.Count == 0)
+                {
+                    EditorUtility.DisplayDialog("Save", "保存対象のアセットが見つかりませんでした。", "OK");
+                    return;
+                }
+
+                string sanitizedAuthor = PathUtil.SanitizeFileName(authorName);
+                if (string.IsNullOrEmpty(sanitizedAuthor))
+                    sanitizedAuthor = "Unknown";
+
+                string saveFolder = $"{sanitizedAuthor}_{currentVersion}";
+                string savePath = Path.Combine(destinationPath, saveFolder);
+                var manifestRelativePaths = GetPackageRelativePaths(targetAssetPaths);
+                var diffInfo = GetSavePackageDifferences(savePath, manifestRelativePaths);
+
+                if (diffInfo.FileDetails.Count > 0 &&
+                    !DiffResultWindow.Confirm(diffInfo, Application.dataPath, savePath, "保存を実行（上書き）"))
+                {
+                    return;
+                }
+
+                ExecuteSaveSelectedPackage(savePath, targetAssetPaths, manifestRelativePaths);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                EditorUtility.DisplayDialog("Save Failed", e.Message, "OK");
+            }
+        }
+
+        private HashSet<string> CollectTargetAssetPaths(List<string> selectedPaths)
+        {
+            var targetAssetPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var path in selectedPaths)
             {
-                string assetPath = NormalizeToAssetPath(path);
-                if (string.IsNullOrEmpty(assetPath)) continue;
+                string assetPath = PathUtil.NormalizeToAssetPath(path);
+                if (string.IsNullOrEmpty(assetPath))
+                    continue;
 
                 if (Directory.Exists(path))
                 {
-                    string[] files = Directory.GetFiles(path, "*.*", SearchOption.AllDirectories);
-                    foreach (var file in files)
+                    foreach (var file in Directory.GetFiles(path, "*.*", SearchOption.AllDirectories))
                     {
-                        if (file.EndsWith(".meta")) continue;
-                        string fileAssetPath = NormalizeToAssetPath(file);
+                        if (file.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        string fileAssetPath = PathUtil.NormalizeToAssetPath(file);
                         if (!string.IsNullOrEmpty(fileAssetPath))
                             targetAssetPaths.Add(fileAssetPath);
                     }
@@ -267,130 +242,96 @@ namespace PackageSaveTool
                 }
             }
 
-            // 依存関係を全自動追加
-            string[] dependencies = AssetDatabase.GetDependencies(targetAssetPaths.OrderBy(p => p).ToArray(), recursive: true);
+            string[] dependencies = AssetDatabase.GetDependencies(targetAssetPaths.OrderBy(p => p).ToArray(), true);
             foreach (var dep in dependencies)
             {
-                if (dep.StartsWith("Assets/"))
-                {
+                if (dep.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
                     targetAssetPaths.Add(dep);
-                }
             }
 
-            string sanitizedAuthor = SanitizeFileName(authorName);
-            if (string.IsNullOrEmpty(sanitizedAuthor))
-                sanitizedAuthor = "Unknown";
-
-            string saveFolder = $"{sanitizedAuthor}_{currentVersion}";
-            string savePath = Path.Combine(destinationPath, saveFolder);
-
-            var manifestRelativePaths = GetPackageRelativePaths(targetAssetPaths);
-            DetailedFolderDiffInfo diffInfo = GetSavePackageDifferences(savePath, manifestRelativePaths);
-
-            if (diffInfo.FileDetails.Count > 0)
-            {
-                DiffResultWindow.ShowWindow(diffInfo, Application.dataPath, savePath, () =>
-                {
-                    ExecuteSaveSelectedPackage(savePath, targetAssetPaths, manifestRelativePaths);
-                }, "保存を実行（上書き）");
-                return;
-            }
-
-            ExecuteSaveSelectedPackage(savePath, targetAssetPaths, manifestRelativePaths);
+            return targetAssetPaths;
         }
 
-        private List<string> GetPackageRelativePaths(IEnumerable<string> targetAssetPaths)
+        private static List<string> GetPackageRelativePaths(IEnumerable<string> targetAssetPaths)
         {
             return targetAssetPaths
-                .Select(GetPathRelativeToAssets)
+                .Select(PathUtil.GetPathRelativeToAssets)
                 .Where(relPath => !string.IsNullOrEmpty(relPath))
-                .Distinct()
-                .OrderBy(relPath => relPath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(relPath => relPath, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
-        private DetailedFolderDiffInfo GetSavePackageDifferences(string savePath, IEnumerable<string> manifestRelativePaths)
+        private static DetailedFolderDiffInfo GetSavePackageDifferences(string savePath, IEnumerable<string> manifestRelativePaths)
         {
-            var result = new DetailedFolderDiffInfo();
+            var relativeList = manifestRelativePaths.ToList();
+            var pairs = new List<DiffFilePair>();
+            var manifestSet = new HashSet<string>(relativeList, StringComparer.OrdinalIgnoreCase);
 
-            if (!Directory.Exists(savePath))
-                return result;
-
-            foreach (var relPath in manifestRelativePaths)
+            foreach (var relPath in relativeList)
             {
-                string sysSourcePath = Path.Combine(Application.dataPath, relPath);
-                string sysDestPath = Path.Combine(savePath, relPath.Replace('/', Path.DirectorySeparatorChar));
+                string sysSourcePath = PathUtil.CombineUnder(Application.dataPath, relPath);
+                string sysDestPath = PathUtil.CombineUnder(savePath, relPath);
+                pairs.Add(new DiffFilePair(relPath, sysSourcePath, sysDestPath));
+            }
 
-                if (!File.Exists(sysSourcePath))
-                    continue;
-
-                var fileDetail = new FileDiffDetail { RelativePath = relPath };
-
-                if (!File.Exists(sysDestPath))
+            if (Directory.Exists(savePath))
+            {
+                foreach (var destFile in FolderDiffer.GetAllFiles(savePath))
                 {
-                    fileDetail.Status = "新規追加";
-                    result.FileDetails.Add(fileDetail);
-                }
-                else if (!FileHashEquals(sysSourcePath, sysDestPath))
-                {
-                    fileDetail.Status = "変更あり";
+                    string rel = PathUtil.GetRelativePath(destFile, savePath);
+                    if (string.Equals(rel, ManifestFileName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (manifestSet.Contains(rel))
+                        continue;
 
-                    if (IsAssetFile(sysSourcePath))
-                    {
-                        fileDetail.PropertyDiffs = CompareProperties(sysDestPath, sysSourcePath);
-                    }
-
-                    result.FileDetails.Add(fileDetail);
+                    pairs.Add(new DiffFilePair(rel, null, destFile));
                 }
             }
 
-            return result;
+            return FolderDiffer.ComparePairs(pairs, includeDeletes: true);
         }
 
-        private void ExecuteSaveSelectedPackage(string savePath, IEnumerable<string> targetAssetPaths, IEnumerable<string> manifestRelativePaths)
+        private void ExecuteSaveSelectedPackage(
+            string savePath,
+            IEnumerable<string> targetAssetPaths,
+            IReadOnlyList<string> manifestRelativePaths)
         {
             Directory.CreateDirectory(savePath);
 
-            foreach (var assetPath in targetAssetPaths)
+            var assetList = targetAssetPaths.ToList();
+            using (var progress = new EditorProgress("Saving package"))
             {
-                string relPath = GetPathRelativeToAssets(assetPath);
-                if (string.IsNullOrEmpty(relPath)) continue;
-
-                string sysSourcePath = Path.Combine(Application.dataPath, relPath);
-                string sysDestPath = Path.Combine(savePath, relPath.Replace('/', Path.DirectorySeparatorChar));
-
-                if (File.Exists(sysSourcePath))
+                for (int i = 0; i < assetList.Count; i++)
                 {
-                    string destDir = Path.GetDirectoryName(sysDestPath);
-                    if (!string.IsNullOrEmpty(destDir))
-                        Directory.CreateDirectory(destDir);
+                    string assetPath = assetList[i];
+                    string relPath = PathUtil.GetPathRelativeToAssets(assetPath);
+                    if (string.IsNullOrEmpty(relPath))
+                        continue;
 
-                    File.Copy(sysSourcePath, sysDestPath, true);
+                    progress.Report(relPath, (i + 1) / (float)assetList.Count);
 
-                    string sysMetaSource = sysSourcePath + ".meta";
-                    if (File.Exists(sysMetaSource))
-                    {
-                        File.Copy(sysMetaSource, sysDestPath + ".meta", true);
-                    }
+                    string sysSourcePath = PathUtil.CombineUnder(Application.dataPath, relPath);
+                    string sysDestPath = PathUtil.CombineUnder(savePath, relPath);
+                    if (File.Exists(sysSourcePath))
+                        FileSync.CopyFileWithMeta(sysSourcePath, sysDestPath);
                 }
             }
 
             var manifest = new SelectionManifest { relativePaths = manifestRelativePaths.ToArray() };
-            string manifestPath = Path.Combine(savePath, ManifestFileName);
-            File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true));
-
-            Debug.Log($"[PackageSaveTool] Saved successfully with dependencies to: {savePath}");
+            File.WriteAllText(Path.Combine(savePath, ManifestFileName), JsonUtility.ToJson(manifest, true));
+            FileSync.RemoveOrphanFiles(savePath, manifestRelativePaths, ManifestFileName);
 
             currentVersion.IncrementPatch();
-            SaveVersionInfo();
-            Debug.Log($"Next Version: {currentVersion}");
+            PackageVersionStore.Save(currentVersion);
 
+            Debug.Log($"[PackageSaveTool] Saved successfully with dependencies to: {savePath}");
+            Debug.Log($"Next Version: {currentVersion}");
             EditorUtility.RevealInFinder(savePath);
         }
 
         private void LoadFolderWithReferenceFixing()
         {
-            // 1. 読み込み元フォルダを選択
             string folderPath = EditorUtility.OpenFolderPanel("Select Folder to Load", "", "");
             if (string.IsNullOrEmpty(folderPath))
             {
@@ -398,7 +339,6 @@ namespace PackageSaveTool
                 return;
             }
 
-            // Manifestが存在する場合はManifest駆動読み込みを実行
             string manifestPath = Path.Combine(folderPath, ManifestFileName);
             if (File.Exists(manifestPath))
             {
@@ -406,9 +346,6 @@ namespace PackageSaveTool
                 return;
             }
 
-            // --- Manifestが無い旧形式パッケージ向けの処理 ---
-
-            // 2. インポート先を選択 (Assets内)
             string importPath = EditorUtility.SaveFolderPanel("Select Import Destination (in Assets folder)", "Assets", "");
             if (string.IsNullOrEmpty(importPath))
             {
@@ -416,141 +353,148 @@ namespace PackageSaveTool
                 return;
             }
 
-            string sourceFolder = GetImportSourceFolder(folderPath);
-            string finalImportPath = Path.Combine(importPath, new DirectoryInfo(sourceFolder).Name);
-
-            // 差分が存在する場合に専用GUIウィンドウを表示し、承認後にのみ読み込みを実行
-            if (FolderHasChanges(sourceFolder, finalImportPath))
+            if (PathUtil.NormalizeToAssetPath(importPath) == null)
             {
-                // 詳細な差分情報（パラメータ差分含む）を取得
-                DetailedFolderDiffInfo diffInfo = GetDetailedFolderDifferences(sourceFolder, finalImportPath);
-
-                // 差分確認ウィンドウを開き、ユーザーが「実行」を押した場合のコールバックを指定
-                DiffResultWindow.ShowWindow(diffInfo, sourceFolder, finalImportPath, () =>
-                {
-                    ExecuteLoad(sourceFolder, finalImportPath, folderPath);
-                });
-
-                return; // ウィンドウ側での操作待ちにするためここで一時中断
+                EditorUtility.DisplayDialog("Error", "Import destination must be inside the Assets folder.", "OK");
+                return;
             }
 
-            // 差分が無い場合はそのまま読み込みを実行
-            ExecuteLoad(sourceFolder, finalImportPath, folderPath);
+            try
+            {
+                string sourceFolder = PackageVersionStore.GetImportSourceFolder(folderPath);
+                string finalImportPath = Path.Combine(importPath, new DirectoryInfo(sourceFolder).Name);
+                var diffInfo = FolderDiffer.CompareFolders(sourceFolder, finalImportPath, includeDeletes: !integrationMode);
+
+                if (diffInfo.FileDetails.Count > 0 &&
+                    !DiffResultWindow.Confirm(diffInfo, sourceFolder, finalImportPath, "読み込みを実行（上書き/統合）"))
+                {
+                    return;
+                }
+
+                ExecuteLoad(sourceFolder, finalImportPath, folderPath);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                EditorUtility.DisplayDialog("Load Failed", e.Message, "OK");
+            }
         }
 
-        /// <summary>
-        /// 差分確認完了後の実際のファイルコピーとバージョン更新処理
-        /// </summary>
         private void ExecuteLoad(string sourceFolder, string finalImportPath, string originalFolderPath)
         {
-            CopyFolder(sourceFolder, finalImportPath, integrationMode);
-
-            VersionInfo loadedVersion = ExtractVersionFromFolderName(originalFolderPath);
-            if (loadedVersion != null)
+            using (new AssetEditingScope())
             {
-                UpdateVersionAfterLoad(loadedVersion);
+                FileSync.CopyDirectory(sourceFolder, finalImportPath, integrationMode);
             }
+
+            VersionInfo loadedVersion = PackageVersionStore.ExtractFromFolderName(originalFolderPath);
+            if (loadedVersion != null)
+                UpdateVersionAfterLoad(loadedVersion);
 
             AssetDatabase.Refresh();
             Debug.Log($"[PackageSaveTool] 読み込みが完了しました: {finalImportPath}");
-            CompleteLoadAndAskAnimatorFix();
+
+            var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in FolderDiffer.GetAllFiles(finalImportPath))
+            {
+                string assetPath = PathUtil.NormalizeToAssetPath(file);
+                if (!string.IsNullOrEmpty(assetPath))
+                    imported.Add(assetPath);
+            }
+
+            CompleteLoadAndAskAnimatorFix(imported);
         }
 
         private void LoadUsingManifest(string sourceRoot, string manifestPath)
         {
-            string json = File.ReadAllText(manifestPath);
-            SelectionManifest manifest = null;
+            SelectionManifest manifest;
             try
             {
-                manifest = JsonUtility.FromJson<SelectionManifest>(json);
+                manifest = JsonUtility.FromJson<SelectionManifest>(File.ReadAllText(manifestPath));
             }
-            catch (System.Exception e)
+            catch (Exception e)
             {
                 Debug.LogError($"Failed to parse manifest: {e.Message}");
+                EditorUtility.DisplayDialog("Load Failed", "マニフェストの解析に失敗しました。", "OK");
                 return;
             }
 
             if (manifest == null || manifest.relativePaths == null || manifest.relativePaths.Length == 0)
             {
                 Debug.LogWarning("Manifest is empty or invalid. Nothing to update.");
+                EditorUtility.DisplayDialog("Load", "マニフェストが空です。", "OK");
                 return;
             }
 
-            string projectAssetsPath = Application.dataPath;
-
-            // マニフェストの範囲内に限定して詳細差分を取得
-            DetailedFolderDiffInfo diffInfo = GetManifestDetailedDifferences(sourceRoot, projectAssetsPath, manifest.relativePaths);
-
-            // 差分が存在する場合は確認ウィンドウを表示
-            if (diffInfo.FileDetails.Count > 0)
+            try
             {
-                DiffResultWindow.ShowWindow(diffInfo, sourceRoot, projectAssetsPath, () =>
+                var diffInfo = GetManifestDetailedDifferences(sourceRoot, Application.dataPath, manifest.relativePaths);
+                if (diffInfo.FileDetails.Count > 0 &&
+                    !DiffResultWindow.Confirm(diffInfo, sourceRoot, Application.dataPath, "読み込みを実行（上書き/統合）"))
                 {
-                    ExecuteLoadUsingManifest(sourceRoot, manifest);
-                });
-            }
-            else
-            {
-                // 差分が無い場合はそのまま読み込みを実行
+                    return;
+                }
+
                 ExecuteLoadUsingManifest(sourceRoot, manifest);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                EditorUtility.DisplayDialog("Load Failed", e.Message, "OK");
             }
         }
 
-        /// <summary>
-        /// 差分確認完了後の実際のManifestベース読み込み処理
-        /// </summary>
         private void ExecuteLoadUsingManifest(string sourceRoot, SelectionManifest manifest)
         {
             string projectAssetsPath = Application.dataPath;
+            var importedAssetPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var relPath in manifest.relativePaths)
+            using (new AssetEditingScope())
+            using (var progress = new EditorProgress("Loading package"))
             {
-                if (string.IsNullOrEmpty(relPath)) continue;
-
-                if (!TryGetSafeManifestPaths(sourceRoot, projectAssetsPath, relPath, out string sourcePath, out string destPath))
+                for (int i = 0; i < manifest.relativePaths.Length; i++)
                 {
-                    Debug.LogWarning($"Skipped unsafe manifest path: {relPath}");
-                    continue;
-                }
+                    string relPath = manifest.relativePaths[i];
+                    if (string.IsNullOrEmpty(relPath))
+                        continue;
 
-                if (File.Exists(sourcePath))
-                {
-                    string destDir = Path.GetDirectoryName(destPath);
-                    if (!string.IsNullOrEmpty(destDir))
-                        Directory.CreateDirectory(destDir);
+                    progress.Report(relPath, (i + 1) / (float)manifest.relativePaths.Length);
 
-                    File.Copy(sourcePath, destPath, true);
-
-                    if (File.Exists(sourcePath + ".meta"))
+                    if (!PathUtil.TryGetSafeManifestPaths(sourceRoot, projectAssetsPath, relPath, out string sourcePath, out string destPath))
                     {
-                        File.Copy(sourcePath + ".meta", destPath + ".meta", true);
+                        Debug.LogWarning($"Skipped unsafe manifest path: {relPath}");
+                        continue;
+                    }
+
+                    if (File.Exists(sourcePath))
+                    {
+                        FileSync.CopyFileWithMeta(sourcePath, destPath);
+                        importedAssetPaths.Add(PathUtil.ToAssetPathFromRelative(relPath));
+                    }
+                    else if (Directory.Exists(sourcePath))
+                    {
+                        FileSync.CopyDirectory(sourcePath, destPath, integrationMode);
+                    }
+                    else if (!integrationMode && File.Exists(destPath))
+                    {
+                        FileSync.DeleteFileWithMeta(destPath);
                     }
                 }
-                else if (Directory.Exists(sourcePath))
-                {
-                    SyncManifestFolderOnly(sourcePath, destPath);
-                }
             }
 
-            VersionInfo loadedVersion = ExtractVersionFromFolderName(sourceRoot);
+            VersionInfo loadedVersion = PackageVersionStore.ExtractFromFolderName(sourceRoot);
             if (loadedVersion != null)
-            {
                 UpdateVersionAfterLoad(loadedVersion);
-            }
 
             AssetDatabase.Refresh();
             Debug.Log("[PackageSaveTool] Load completed using selection_manifest scope.");
-            CompleteLoadAndAskAnimatorFix();
+            CompleteLoadAndAskAnimatorFix(importedAssetPaths);
         }
 
-        /// <summary>
-        /// Load後はAnimatorControllerをスキャンするだけに留め、修復実行前にユーザー承認を求める。
-        /// </summary>
-        private void CompleteLoadAndAskAnimatorFix()
+        private void CompleteLoadAndAskAnimatorFix(ICollection<string> importedAssetPaths)
         {
-            var reports = ScanAllAnimatorControllers();
+            var reports = ScanAnimatorControllers(importedAssetPaths, showWindow: true);
             int missingCount = reports.Count;
-
             if (missingCount == 0)
             {
                 EditorUtility.DisplayDialog(
@@ -567,94 +511,30 @@ namespace PackageSaveTool
                 "スキャンのみで終了");
 
             if (shouldFix)
-            {
-                FixAllAnimatorControllers();
-            }
+                FixAnimatorControllers(importedAssetPaths);
         }
 
-        /// <summary>
-        /// マニフェストに定義されたファイル群のみを対象とした差分検出
-        /// </summary>
-        private DetailedFolderDiffInfo GetManifestDetailedDifferences(string sourceRoot, string projectAssetsPath, string[] relativePaths)
+        private DetailedFolderDiffInfo GetManifestDetailedDifferences(
+            string sourceRoot,
+            string projectAssetsPath,
+            string[] relativePaths)
         {
-            var result = new DetailedFolderDiffInfo();
-
+            var pairs = new List<DiffFilePair>(relativePaths.Length);
             foreach (var relPath in relativePaths)
             {
-                if (string.IsNullOrEmpty(relPath)) continue;
+                if (string.IsNullOrEmpty(relPath))
+                    continue;
 
-                if (!TryGetSafeManifestPaths(sourceRoot, projectAssetsPath, relPath, out string srcPath, out string dstPath))
+                if (!PathUtil.TryGetSafeManifestPaths(sourceRoot, projectAssetsPath, relPath, out string srcPath, out string dstPath))
                 {
                     Debug.LogWarning($"Skipped unsafe manifest path: {relPath}");
                     continue;
                 }
 
-                bool inSource = File.Exists(srcPath);
-                bool inDest = File.Exists(dstPath);
-
-                var fileDetail = new FileDiffDetail { RelativePath = relPath };
-
-                if (inSource && !inDest)
-                {
-                    fileDetail.Status = "新規追加";
-                    result.FileDetails.Add(fileDetail);
-                }
-                else if (!inSource && inDest)
-                {
-                    fileDetail.Status = "削除";
-                    result.FileDetails.Add(fileDetail);
-                }
-                else if (inSource && inDest && !FileHashEquals(srcPath, dstPath))
-                {
-                    fileDetail.Status = "変更あり";
-
-                    // YAML / アセットファイル等のパラメータ差分を取得
-                    if (IsAssetFile(srcPath))
-                    {
-                        fileDetail.PropertyDiffs = CompareProperties(dstPath, srcPath);
-                    }
-
-                    result.FileDetails.Add(fileDetail);
-                }
+                pairs.Add(new DiffFilePair(relPath, srcPath, dstPath));
             }
 
-            return result;
-        }
-
-        private void SyncManifestFolderOnly(string sourceDir, string destDir)
-        {
-            if (!Directory.Exists(destDir))
-            {
-                Directory.CreateDirectory(destDir);
-            }
-
-            if (!integrationMode)
-            {
-                var destFiles = Directory.GetFiles(destDir, "*.*", SearchOption.AllDirectories);
-                foreach (var destFile in destFiles)
-                {
-                    string relToDest = destFile.Substring(destDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                    string correspondingSource = Path.Combine(sourceDir, relToDest);
-
-                    if (!File.Exists(correspondingSource))
-                    {
-                        File.Delete(destFile);
-                    }
-                }
-            }
-
-            var sourceFiles = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
-            foreach (var srcFile in sourceFiles)
-            {
-                string relToSource = srcFile.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                string targetDest = Path.Combine(destDir, relToSource);
-
-                string targetDir = Path.GetDirectoryName(targetDest);
-                if (!string.IsNullOrEmpty(targetDir))
-                    Directory.CreateDirectory(targetDir);
-
-                File.Copy(srcFile, targetDest, true);
-            }
+            return FolderDiffer.ComparePairs(pairs, includeDeletes: !integrationMode);
         }
         #endregion
 
@@ -662,593 +542,124 @@ namespace PackageSaveTool
         private void CopyComponentsFromPrefabToFBX()
         {
             string sourcePrefabPath = EditorUtility.OpenFilePanel("Select Source Prefab", "Assets", "prefab");
-            if (string.IsNullOrEmpty(sourcePrefabPath)) return;
+            if (string.IsNullOrEmpty(sourcePrefabPath))
+                return;
 
-            string relativeSourcePath = NormalizeToAssetPath(sourcePrefabPath);
+            string relativeSourcePath = PathUtil.NormalizeToAssetPath(sourcePrefabPath);
             if (string.IsNullOrEmpty(relativeSourcePath))
             {
                 EditorUtility.DisplayDialog("Error", "Selected prefab is not in Assets folder.", "OK");
                 return;
             }
 
-            GameObject sourcePrefab = AssetDatabase.LoadAssetAtPath<GameObject>(relativeSourcePath);
-
             string targetFBXPath = EditorUtility.OpenFilePanel("Select Target FBX", "Assets", "fbx");
-            if (string.IsNullOrEmpty(targetFBXPath)) return;
+            if (string.IsNullOrEmpty(targetFBXPath))
+                return;
 
-            string relativeTargetPath = NormalizeToAssetPath(targetFBXPath);
+            string relativeTargetPath = PathUtil.NormalizeToAssetPath(targetFBXPath);
             if (string.IsNullOrEmpty(relativeTargetPath))
             {
                 EditorUtility.DisplayDialog("Error", "Selected FBX is not in Assets folder.", "OK");
                 return;
             }
 
-            GameObject targetFBX = AssetDatabase.LoadAssetAtPath<GameObject>(relativeTargetPath);
+            string savePath = EditorUtility.SaveFilePanel(
+                "Save FBX as Prefab",
+                "Assets",
+                Path.GetFileNameWithoutExtension(relativeTargetPath) + "_withComponents",
+                "prefab");
+            if (string.IsNullOrEmpty(savePath))
+                return;
 
-            string savePath = EditorUtility.SaveFilePanel("Save FBX as Prefab", "Assets", Path.GetFileNameWithoutExtension(relativeTargetPath) + "_withComponents", "prefab");
-            if (string.IsNullOrEmpty(savePath)) return;
-
-            string relativeSavePath = NormalizeToAssetPath(savePath);
+            string relativeSavePath = PathUtil.NormalizeToAssetPath(savePath);
             if (string.IsNullOrEmpty(relativeSavePath))
             {
                 EditorUtility.DisplayDialog("Error", "Save path must be inside the Assets folder.", "OK");
                 return;
             }
 
-            if (sourcePrefab == null || targetFBX == null)
+            GameObject sourcePrefab = AssetDatabase.LoadAssetAtPath<GameObject>(relativeSourcePath);
+            GameObject targetFBX = AssetDatabase.LoadAssetAtPath<GameObject>(relativeTargetPath);
+
+            if (!PrefabComponentCopier.TryCopy(sourcePrefab, targetFBX, relativeSavePath, out string error))
             {
-                EditorUtility.DisplayDialog("Error", "Failed to load the selected prefab or FBX asset.", "OK");
+                EditorUtility.DisplayDialog("Error", error ?? "Failed to copy components.", "OK");
                 return;
             }
 
-            GameObject instance = PrefabUtility.InstantiatePrefab(targetFBX) as GameObject;
-            if (instance == null)
-            {
-                instance = Instantiate(targetFBX);
-            }
-
-            CopyComponents(sourcePrefab, instance, sourcePrefab, instance);
-
-            PrefabUtility.SaveAsPrefabAsset(instance, relativeSavePath);
-            DestroyImmediate(instance);
-
-            AssetDatabase.Refresh();
             Debug.Log($"Successfully copied components to {relativeSavePath}");
             EditorUtility.RevealInFinder(savePath);
-        }
-
-        private void CopyComponents(GameObject source, GameObject target, GameObject sourceRoot, GameObject targetRoot)
-        {
-            Component[] sourceComponents = source.GetComponents<Component>();
-
-            foreach (Component sourceComponent in sourceComponents)
-            {
-                if (sourceComponent is Transform)
-                    continue;
-
-                System.Type componentType = sourceComponent.GetType();
-                Component existingComponent = target.GetComponent(componentType);
-
-                if (existingComponent != null)
-                {
-                    CopyComponentProperties(sourceComponent, existingComponent, sourceRoot, targetRoot);
-                }
-                else
-                {
-                    Component newComponent = target.AddComponent(componentType);
-                    CopyComponentProperties(sourceComponent, newComponent, sourceRoot, targetRoot);
-                }
-            }
-
-            for (int i = 0; i < source.transform.childCount; i++)
-            {
-                Transform sourceChild = source.transform.GetChild(i);
-                Transform targetChild = target.transform.Find(sourceChild.name);
-
-                if (targetChild == null)
-                {
-                    GameObject newChild = new GameObject(sourceChild.name);
-                    newChild.transform.SetParent(target.transform);
-                    newChild.transform.localPosition = sourceChild.localPosition;
-                    newChild.transform.localRotation = sourceChild.localRotation;
-                    newChild.transform.localScale = sourceChild.localScale;
-                    targetChild = newChild.transform;
-                }
-
-                CopyComponents(sourceChild.gameObject, targetChild.gameObject, sourceRoot, targetRoot);
-            }
-        }
-
-        private void CopyComponentProperties(Component sourceComponent, Component targetComponent, GameObject sourceRoot, GameObject targetRoot)
-        {
-            SerializedObject sourceSO = new SerializedObject(sourceComponent);
-            SerializedObject targetSO = new SerializedObject(targetComponent);
-
-            SerializedProperty sourceProp = sourceSO.GetIterator();
-            while (sourceProp.NextVisible(true))
-            {
-                if (sourceProp.propertyType == SerializedPropertyType.ObjectReference &&
-                    (sourceProp.name == "m_Materials" || sourceProp.name == "bones" ||
-                     sourceProp.name == "m_SharedMaterials" || sourceProp.name == "m_SharedMesh" ||
-                     sourceProp.name == "m_Mesh"))
-                {
-                    continue;
-                }
-
-                SerializedProperty targetProp = targetSO.FindProperty(sourceProp.propertyPath);
-                if (targetProp == null || targetProp.propertyType != sourceProp.propertyType)
-                    continue;
-
-                if (sourceProp.propertyType == SerializedPropertyType.ObjectReference && sourceProp.objectReferenceValue != null)
-                {
-                    Object resolvedRef = ResolveObjectReference(sourceProp.objectReferenceValue, sourceRoot, targetRoot);
-                    if (resolvedRef != null)
-                    {
-                        targetProp.objectReferenceValue = resolvedRef;
-                        targetSO.ApplyModifiedProperties();
-                        continue;
-                    }
-                }
-
-                targetSO.CopyFromSerializedProperty(sourceProp);
-            }
-
-            targetSO.ApplyModifiedProperties();
-        }
-
-        private Object ResolveObjectReference(Object sourceReference, GameObject sourceRoot, GameObject targetRoot)
-        {
-            if (sourceReference == null || sourceRoot == null || targetRoot == null)
-                return sourceReference;
-
-            if (sourceReference is Transform sourceTransform)
-            {
-                return FindCorrespondingTransform(sourceTransform, sourceRoot, targetRoot);
-            }
-
-            if (sourceReference is GameObject sourceGameObject)
-            {
-                var targetTransform = FindCorrespondingTransform(sourceGameObject.transform, sourceRoot, targetRoot);
-                return targetTransform != null ? targetTransform.gameObject : null;
-            }
-
-            if (sourceReference is Component sourceComponent)
-            {
-                var targetTransform = FindCorrespondingTransform(sourceComponent.transform, sourceRoot, targetRoot);
-                if (targetTransform == null)
-                    return null;
-                return targetTransform.GetComponent(sourceComponent.GetType());
-            }
-
-            return sourceReference;
-        }
-
-        private Transform FindCorrespondingTransform(Transform sourceTransform, GameObject sourceRoot, GameObject targetRoot)
-        {
-            string relativePath = GetRelativeTransformPath(sourceTransform, sourceRoot.transform);
-            if (relativePath == null)
-                return null;
-
-            if (string.IsNullOrEmpty(relativePath))
-                return targetRoot.transform;
-
-            return targetRoot.transform.Find(relativePath);
-        }
-
-        private string GetRelativeTransformPath(Transform transform, Transform root)
-        {
-            if (transform == root)
-                return string.Empty;
-
-            var segments = new List<string>();
-            Transform current = transform;
-            while (current != null && current != root)
-            {
-                segments.Insert(0, current.name);
-                current = current.parent;
-            }
-
-            return current == root ? string.Join("/", segments) : null;
         }
         #endregion
 
         #region Animator修復呼び出し
-        private List<AnimatorFixReport> ScanAllAnimatorControllers()
+        private List<AnimatorFixReport> ScanAnimatorControllers(
+            ICollection<string> assetPathFilter = null,
+            bool showWindow = true)
         {
-            AssetDatabase.Refresh();
-            string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
-            var allReports = new List<AnimatorFixReport>();
+            var allReports = ProcessAnimatorControllers(
+                controller => AnimatorControllerFixer.ScanMissingClips(controller),
+                assetPathFilter,
+                saveAssets: false);
 
-            foreach (string guid in controllerGuids)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guid);
-                var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
-                if (controller != null)
-                {
-                    var reports = AnimatorControllerFixer.ScanMissingClips(controller);
-                    allReports.AddRange(reports);
-                }
-            }
+            if (showWindow)
+                AnimatorFixResultWindow.ShowReport(allReports, "Animator Missing Scan Results");
 
-            AnimatorFixResultWindow.ShowReport(allReports, "Animator Missing Scan Results");
             return allReports;
         }
 
-        private void FixAllAnimatorControllers()
+        private void FixAnimatorControllers(ICollection<string> assetPathFilter = null)
         {
-            AssetDatabase.Refresh();
-            string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
-            var allReports = new List<AnimatorFixReport>();
-
-            foreach (string guid in controllerGuids)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guid);
-                var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
-                if (controller != null)
-                {
-                    var reports = AnimatorControllerFixer.DetectAndFixMissingClips(controller);
-                    allReports.AddRange(reports);
-                }
-            }
+            var allReports = ProcessAnimatorControllers(
+                controller => AnimatorControllerFixer.FixMissingClips(controller),
+                assetPathFilter,
+                saveAssets: true);
 
             AnimatorFixResultWindow.ShowReport(allReports, "Animator Fix Results");
         }
-        #endregion
 
-        #region ユーティリティ
-        private string SanitizeFileName(string fileName)
+        private static List<AnimatorFixReport> ProcessAnimatorControllers(
+            Func<AnimatorController, List<AnimatorFixReport>> processor,
+            ICollection<string> assetPathFilter,
+            bool saveAssets)
         {
-            var invalidChars = Path.GetInvalidFileNameChars();
-            var sanitized = new StringBuilder();
-            foreach (var c in fileName)
+            var allReports = new List<AnimatorFixReport>();
+            string[] controllerGuids = AssetDatabase.FindAssets("t:AnimatorController");
+            HashSet<string> filter = assetPathFilter != null
+                ? new HashSet<string>(assetPathFilter, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            try
             {
-                if (!invalidChars.Contains(c))
-                    sanitized.Append(c);
-            }
-            return sanitized.ToString().Trim();
-        }
-
-        private string GetPathRelativeToAssets(string fullPath)
-        {
-            string normalized = fullPath.Replace('\\', '/').TrimEnd('/');
-            string assetsAbsolute = Application.dataPath.Replace('\\', '/').TrimEnd('/');
-
-            if (normalized.StartsWith(assetsAbsolute + "/", System.StringComparison.OrdinalIgnoreCase))
-                return normalized.Substring(assetsAbsolute.Length + 1);
-
-            if (normalized.Equals(assetsAbsolute, System.StringComparison.OrdinalIgnoreCase))
-                return string.Empty;
-
-            const string prefix = "Assets/";
-            if (normalized.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase))
-                return normalized.Substring(prefix.Length);
-
-            if (normalized.Equals("Assets", System.StringComparison.OrdinalIgnoreCase))
-                return string.Empty;
-
-            return Path.GetFileName(normalized);
-        }
-
-        private string NormalizeToAssetPath(string path)
-        {
-            string normalized = path.Replace('\\', '/');
-            string dataPath = Application.dataPath.Replace('\\', '/');
-            if (normalized.Equals(dataPath, System.StringComparison.OrdinalIgnoreCase))
-            {
-                return "Assets";
-            }
-            if (normalized.StartsWith(dataPath + "/", System.StringComparison.OrdinalIgnoreCase))
-            {
-                return "Assets" + normalized.Substring(dataPath.Length);
-            }
-            if (normalized.StartsWith("Assets/", System.StringComparison.OrdinalIgnoreCase))
-            {
-                return normalized;
-            }
-            return null;
-        }
-
-        private List<string> FilterTopLevelSelections(List<string> selectedPaths)
-        {
-            var filtered = new List<string>();
-            var normalizedPaths = selectedPaths.Select(p => Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)).ToList();
-
-            foreach (var path in normalizedPaths.OrderBy(p => p.Length))
-            {
-                if (!filtered.Any(parent => IsAncestor(parent, path)))
+                using (var progress = new EditorProgress(saveAssets ? "Fixing AnimatorControllers" : "Scanning AnimatorControllers"))
                 {
-                    filtered.Add(path);
-                }
-            }
-
-            return filtered;
-        }
-
-        private bool IsAncestor(string ancestorPath, string path)
-        {
-            if (string.Equals(ancestorPath, path, System.StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            ancestorPath = ancestorPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            path = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            return path.StartsWith(ancestorPath, System.StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool TryGetSafeManifestPaths(
-            string sourceRoot,
-            string projectAssetsPath,
-            string relativePath,
-            out string sourcePath,
-            out string destinationPath)
-        {
-            sourcePath = null;
-            destinationPath = null;
-
-            if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath))
-                return false;
-
-            string normalizedRel = relativePath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
-            string fullSourceRoot = Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string fullAssetsRoot = Path.GetFullPath(projectAssetsPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string fullSourcePath = Path.GetFullPath(Path.Combine(fullSourceRoot, normalizedRel));
-            string fullDestinationPath = Path.GetFullPath(Path.Combine(fullAssetsRoot, normalizedRel));
-
-            if (!fullSourcePath.StartsWith(fullSourceRoot, System.StringComparison.OrdinalIgnoreCase) ||
-                !fullDestinationPath.StartsWith(fullAssetsRoot, System.StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            sourcePath = fullSourcePath;
-            destinationPath = fullDestinationPath;
-            return true;
-        }
-        #endregion
-
-        #region 差分判定ロジック
-        public static DetailedFolderDiffInfo GetDetailedFolderDifferences(string sourceFolder, string destinationFolder)
-        {
-            var result = new DetailedFolderDiffInfo();
-            var sourceFiles = GetAllFiles(sourceFolder).ToDictionary(f => GetRelativePath(f, sourceFolder));
-            var destFiles = Directory.Exists(destinationFolder)
-                ? GetAllFiles(destinationFolder).ToDictionary(f => GetRelativePath(f, destinationFolder))
-                : new Dictionary<string, string>();
-
-            var allRelPaths = sourceFiles.Keys.Union(destFiles.Keys).OrderBy(p => p);
-
-            foreach (var relPath in allRelPaths)
-            {
-                bool inSource = sourceFiles.TryGetValue(relPath, out string srcPath);
-                bool inDest = destFiles.TryGetValue(relPath, out string dstPath);
-
-                var fileDetail = new FileDiffDetail { RelativePath = relPath };
-
-                if (inSource && !inDest)
-                {
-                    fileDetail.Status = "新規追加";
-                    result.FileDetails.Add(fileDetail);
-                }
-                else if (!inSource && inDest)
-                {
-                    fileDetail.Status = "削除";
-                    result.FileDetails.Add(fileDetail);
-                }
-                else if (inSource && inDest && !FileHashEquals(srcPath, dstPath))
-                {
-                    fileDetail.Status = "変更あり";
-
-                    // YAML/アセットファイル等のパラメータ差分を取得
-                    if (IsAssetFile(srcPath))
+                    for (int i = 0; i < controllerGuids.Length; i++)
                     {
-                        fileDetail.PropertyDiffs = CompareProperties(dstPath, srcPath);
-                    }
+                        string path = AssetDatabase.GUIDToAssetPath(controllerGuids[i]);
+                        progress.Report(path, (i + 1) / (float)controllerGuids.Length);
 
-                    result.FileDetails.Add(fileDetail);
-                }
-            }
+                        if (filter != null && !filter.Contains(path))
+                            continue;
 
-            return result;
-        }
+                        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
+                        if (controller == null)
+                            continue;
 
-        /// <summary>
-        /// アセットファイル内のキー＆バリュー形式の行を比較してパラメータ差分を抽出
-        /// </summary>
-        private static List<PropertyDiffItem> CompareProperties(string oldFilePath, string newFilePath)
-        {
-            var oldProps = ParseYamlProperties(oldFilePath);
-            var newProps = ParseYamlProperties(newFilePath);
-            var diffs = new List<PropertyDiffItem>();
-
-            // 変更および新規キーの抽出
-            foreach (var kv in newProps)
-            {
-                if (oldProps.TryGetValue(kv.Key, out string oldValue))
-                {
-                    if (oldValue != kv.Value)
-                    {
-                        diffs.Add(new PropertyDiffItem
-                        {
-                            PropertyName = kv.Key,
-                            OldValue = oldValue,
-                            NewValue = kv.Value
-                        });
+                        allReports.AddRange(processor(controller));
                     }
                 }
-                else
-                {
-                    diffs.Add(new PropertyDiffItem
-                    {
-                        PropertyName = kv.Key,
-                        OldValue = "(なし)",
-                        NewValue = kv.Value
-                    });
-                }
-            }
 
-            // 削除されたキーの抽出
-            foreach (var kv in oldProps)
+                if (saveAssets)
+                    AssetDatabase.SaveAssets();
+            }
+            catch (Exception e)
             {
-                if (!newProps.ContainsKey(kv.Key))
-                {
-                    diffs.Add(new PropertyDiffItem
-                    {
-                        PropertyName = kv.Key,
-                        OldValue = kv.Value,
-                        NewValue = "(削除)"
-                    });
-                }
+                Debug.LogException(e);
+                EditorUtility.DisplayDialog("Animator Tool Failed", e.Message, "OK");
             }
 
-            return diffs;
-        }
-
-        /// <summary>
-        /// YAML / Unityアセット形式のテキストからパラメータ(Key: Value)を抽出
-        /// </summary>
-        private static Dictionary<string, string> ParseYamlProperties(string filePath)
-        {
-            var props = new Dictionary<string, string>();
-            string currentContext = "";
-
-            foreach (var line in File.ReadLines(filePath))
-            {
-                string trimmed = line.Trim();
-
-                // YAMLブロック/オブジェクトIDの判定
-                if (trimmed.StartsWith("--- !u!"))
-                {
-                    currentContext = trimmed;
-                    continue;
-                }
-
-                int colonIndex = trimmed.IndexOf(':');
-                if (colonIndex > 0)
-                {
-                    string key = trimmed.Substring(0, colonIndex).Trim();
-                    string val = trimmed.Substring(colonIndex + 1).Trim();
-
-                    // 値が存在し、コメント等でない場合にパース
-                    if (!string.IsNullOrEmpty(val) && !key.StartsWith("#"))
-                    {
-                        string fullKey = string.IsNullOrEmpty(currentContext) ? key : $"{currentContext} -> {key}";
-                        props[fullKey] = val;
-                    }
-                }
-            }
-
-            return props;
-        }
-
-        private static bool IsAssetFile(string filePath)
-        {
-            string ext = Path.GetExtension(filePath).ToLower();
-            return ext == ".mat" || ext == ".prefab" || ext == ".asset" || ext == ".json" || ext == ".controller";
-        }
-
-        public static bool FileHashEquals(string file1, string file2)
-        {
-            var info1 = new FileInfo(file1);
-            var info2 = new FileInfo(file2);
-
-            // ファイルサイズが異なればハッシュ計算せずに偽を返す（高速化）
-            if (info1.Length != info2.Length)
-                return false;
-
-            using (var sha256 = SHA256.Create())
-            using (var stream1 = File.OpenRead(file1))
-            using (var stream2 = File.OpenRead(file2))
-            {
-                byte[] hash1 = sha256.ComputeHash(stream1);
-                byte[] hash2 = sha256.ComputeHash(stream2);
-                return hash1.SequenceEqual(hash2);
-            }
-        }
-
-        private static string GetRelativePath(string filePath, string rootFolder)
-        {
-            string normalizedFile = filePath.Replace('\\', '/');
-            string normalizedRoot = rootFolder.Replace('\\', '/').TrimEnd('/') + '/';
-
-            if (normalizedFile.StartsWith(normalizedRoot, System.StringComparison.OrdinalIgnoreCase))
-            {
-                return normalizedFile.Substring(normalizedRoot.Length);
-            }
-
-            return Path.GetFileName(filePath);
-        }
-
-        private static List<string> GetAllFiles(string folderPath)
-        {
-            return Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories)
-                .Where(f => !f.EndsWith(".meta"))
-                .ToList();
+            return allReports;
         }
         #endregion
-
-        #region ユーティリティ
-        private string GetImportSourceFolder(string folderPath)
-        {
-            string folderName = Path.GetFileName(folderPath);
-            if (IsVersionedWrapperFolder(folderName))
-            {
-                var childDirs = Directory.GetDirectories(folderPath).OrderBy(p => Path.GetFileName(p)).ToArray();
-                if (childDirs.Length > 0)
-                {
-                    return childDirs[0];
-                }
-            }
-            return folderPath;
-        }
-
-        private bool IsVersionedWrapperFolder(string folderName)
-        {
-            if (string.IsNullOrEmpty(folderName)) return false;
-            return Regex.IsMatch(folderName, @"^.+(?:[_=])[vV]?\d+\.\d+\.\d+$");
-        }
-
-        private bool FolderHasChanges(string sourceFolder, string destinationFolder)
-        {
-            if (!Directory.Exists(destinationFolder)) return true;
-
-            var sourceFiles = GetAllFiles(sourceFolder);
-            var destFiles = GetAllFiles(destinationFolder);
-
-            if (sourceFiles.Count != destFiles.Count) return true;
-
-            foreach (var file in sourceFiles)
-            {
-                string relativePath = GetRelativePath(file, sourceFolder);
-                string destFile = Path.Combine(destinationFolder, relativePath);
-
-                if (!File.Exists(destFile) || !FileHashEquals(file, destFile))
-                    return true;
-            }
-
-            return false;
-        }
-
-        private void CopyFolder(string sourcePath, string destPath, bool merge)
-        {
-            if (!merge && Directory.Exists(destPath))
-            {
-                Directory.Delete(destPath, true);
-            }
-
-            Directory.CreateDirectory(destPath);
-
-            foreach (var file in Directory.GetFiles(sourcePath))
-            {
-                string fileName = Path.GetFileName(file);
-                File.Copy(file, Path.Combine(destPath, fileName), true);
-            }
-
-            foreach (var folder in Directory.GetDirectories(sourcePath))
-            {
-                string folderName = Path.GetFileName(folder);
-                CopyFolder(folder, Path.Combine(destPath, folderName), merge);
-            }
-        }
-        #endregion
-
     }
 }

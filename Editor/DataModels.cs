@@ -7,7 +7,7 @@ namespace PackageSaveTool
     /// セマンティックバージョン情報
     /// </summary>
     [Serializable]
-    public class VersionInfo
+    public class VersionInfo : IComparable<VersionInfo>
     {
         public int major = 1;
         public int minor = 0;
@@ -27,6 +27,11 @@ namespace PackageSaveTool
             return $"v{major}.{minor}.{patch}";
         }
 
+        public VersionInfo Clone()
+        {
+            return new VersionInfo(major, minor, patch);
+        }
+
         public void IncrementMajor()
         {
             major++;
@@ -44,6 +49,18 @@ namespace PackageSaveTool
         {
             patch++;
         }
+
+        public int CompareTo(VersionInfo other)
+        {
+            if (other == null)
+                return 1;
+
+            int cmp = major.CompareTo(other.major);
+            if (cmp != 0) return cmp;
+            cmp = minor.CompareTo(other.minor);
+            if (cmp != 0) return cmp;
+            return patch.CompareTo(other.patch);
+        }
     }
 
     /// <summary>
@@ -55,24 +72,11 @@ namespace PackageSaveTool
         public string[] relativePaths;
     }
 
-    /// <summary>
-    /// フォルダ差分情報
-    /// </summary>
-    public class FolderDiffInfo
+    public static class DiffStatus
     {
-        public List<string> Added = new List<string>();
-        public List<string> Modified = new List<string>();
-        public List<string> Removed = new List<string>();
-
-        public IEnumerable<string> GetAllLines()
-        {
-            foreach (var line in Added)
-                yield return $"追加: {line}";
-            foreach (var line in Modified)
-                yield return $"変更: {line}";
-            foreach (var line in Removed)
-                yield return $"削除: {line}";
-        }
+        public const string Added = "新規追加";
+        public const string Removed = "削除";
+        public const string Modified = "変更あり";
     }
 
     /// <summary>
@@ -85,20 +89,21 @@ namespace PackageSaveTool
         public string StateName;
         public string ReassignedClipName;
         public string ClipPath;
-        public bool IsFixed; // true: 修復済み, false: Missing検出のみ
+        public bool IsFixed;
+        public string Note;
     }
 
     public class PropertyDiffItem
     {
-        public string PropertyName { get; set; } // パラメータ名（キー）
-        public string OldValue { get; set; }     // 変更前の値
-        public string NewValue { get; set; }     // 変更後の値
+        public string PropertyName { get; set; }
+        public string OldValue { get; set; }
+        public string NewValue { get; set; }
     }
 
     public class FileDiffDetail
     {
         public string RelativePath { get; set; }
-        public string Status { get; set; } // "追加", "削除", "パラメータ変更"
+        public string Status { get; set; }
         public List<PropertyDiffItem> PropertyDiffs { get; set; } = new List<PropertyDiffItem>();
     }
 
