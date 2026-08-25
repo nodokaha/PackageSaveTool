@@ -29,6 +29,7 @@ namespace PackageSaveTool
             win.destPath = dest;
             win.confirmButtonLabel = string.IsNullOrEmpty(confirmLabel) ? "実行" : confirmLabel;
             win.minSize = new Vector2(500, 400);
+            win.position = new Rect(120, 80, 720, 520);
             win.modalState = state;
             win.ShowModal();
             return state.Confirmed;

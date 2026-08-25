@@ -77,12 +77,12 @@ namespace PackageSaveTool
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Save Folder (With Version Control & Dependencies)", GUILayout.Height(40)))
-                FolderSelectionWindow.ShowWindow(OnFoldersSelected);
+                EditorApplication.delayCall += () => FolderSelectionWindow.ShowWindow(OnFoldersSelected);
 
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Load Folder (Import & Fix References)", GUILayout.Height(40)))
-                LoadFolderWithReferenceFixing();
+                EditorApplication.delayCall += LoadFolderWithReferenceFixing;
 
             EditorGUILayout.Space();
             EditorGUILayout.Separator();
@@ -106,7 +106,7 @@ namespace PackageSaveTool
                 "Save: 選択された項目とDependencies(依存関係)を一括保存します。\n\n" +
                 "Load: Manifestファイルを元に相対パスで正確に復元読み込みを行います。差分を表示し、ユーザー承認後にのみ読み込みます。\n\n" +
                 "Copy Components: Prefabのコンポーネント設定をFBXモデル階層に転写し、新たなPrefabを出力します。\n\n" +
-                "Scan / Fix: AnimatorController内のMissingアニメーションクリップを検出・補完します。Load後はスキャンのみ行い、修復前に確認します。",
+                "Scan / Fix: AnimatorController内のMissingアニメーションクリップを検出・補完します。Load後はスキャンのみ行い、修復は「2. Fix Animator Controllers Missing Clips」で実行します。",
                 MessageType.Info);
 
             GUILayout.EndScrollView();
@@ -395,14 +395,8 @@ namespace PackageSaveTool
             Debug.Log($"[PackageSaveTool] 読み込みが完了しました: {finalImportPath}");
 
             var imported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in FolderDiffer.GetAllFiles(finalImportPath))
-            {
-                string assetPath = PathUtil.NormalizeToAssetPath(file);
-                if (!string.IsNullOrEmpty(assetPath))
-                    imported.Add(assetPath);
-            }
-
-            CompleteLoadAndAskAnimatorFix(imported);
+            CollectImportedAssetPaths(finalImportPath, imported);
+            CompleteLoadAndScanAnimator(imported);
         }
 
         private void LoadUsingManifest(string sourceRoot, string manifestPath)
@@ -474,6 +468,7 @@ namespace PackageSaveTool
                     else if (Directory.Exists(sourcePath))
                     {
                         FileSync.CopyDirectory(sourcePath, destPath, integrationMode);
+                        CollectImportedAssetPaths(destPath, importedAssetPaths);
                     }
                     else if (!integrationMode && File.Exists(destPath))
                     {
@@ -488,10 +483,20 @@ namespace PackageSaveTool
 
             AssetDatabase.Refresh();
             Debug.Log("[PackageSaveTool] Load completed using selection_manifest scope.");
-            CompleteLoadAndAskAnimatorFix(importedAssetPaths);
+            CompleteLoadAndScanAnimator(importedAssetPaths);
         }
 
-        private void CompleteLoadAndAskAnimatorFix(ICollection<string> importedAssetPaths)
+        private static void CollectImportedAssetPaths(string folderPath, HashSet<string> importedAssetPaths)
+        {
+            foreach (var file in FolderDiffer.GetAllFiles(folderPath))
+            {
+                string assetPath = PathUtil.NormalizeToAssetPath(file);
+                if (!string.IsNullOrEmpty(assetPath))
+                    importedAssetPaths.Add(assetPath);
+            }
+        }
+
+        private void CompleteLoadAndScanAnimator(ICollection<string> importedAssetPaths)
         {
             var reports = ScanAnimatorControllers(importedAssetPaths, showWindow: true);
             int missingCount = reports.Count;
@@ -504,14 +509,10 @@ namespace PackageSaveTool
                 return;
             }
 
-            bool shouldFix = EditorUtility.DisplayDialog(
+            EditorUtility.DisplayDialog(
                 "Animation Clips Missing",
-                $"フォルダの読み込みが完了しました。\n\nAnimatorController 内に Missing AnimationClip が {missingCount} 件見つかりました。\n結果ウィンドウを確認できます。\n\n修復を実行しますか？",
-                "修復する",
-                "スキャンのみで終了");
-
-            if (shouldFix)
-                FixAnimatorControllers(importedAssetPaths);
+                $"フォルダの読み込みが完了しました。\n\nAnimatorController 内に Missing AnimationClip が {missingCount} 件見つかりました。\n結果ウィンドウを確認できます。\n\n修復は自動では行いません。「2. Fix Animator Controllers Missing Clips」から実行してください。",
+                "OK");
         }
 
         private DetailedFolderDiffInfo GetManifestDetailedDifferences(
@@ -519,7 +520,10 @@ namespace PackageSaveTool
             string projectAssetsPath,
             string[] relativePaths)
         {
-            var pairs = new List<DiffFilePair>(relativePaths.Length);
+            var pairs = new List<DiffFilePair>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var expanded = new List<DiffFilePair>();
+
             foreach (var relPath in relativePaths)
             {
                 if (string.IsNullOrEmpty(relPath))
@@ -531,7 +535,13 @@ namespace PackageSaveTool
                     continue;
                 }
 
-                pairs.Add(new DiffFilePair(relPath, srcPath, dstPath));
+                expanded.Clear();
+                FolderDiffer.AddExpandedPairs(expanded, relPath, srcPath, dstPath, ManifestFileName);
+                foreach (var pair in expanded)
+                {
+                    if (seen.Add(pair.RelativePath))
+                        pairs.Add(pair);
+                }
             }
 
             return FolderDiffer.ComparePairs(pairs, includeDeletes: !integrationMode);
@@ -638,7 +648,7 @@ namespace PackageSaveTool
                         string path = AssetDatabase.GUIDToAssetPath(controllerGuids[i]);
                         progress.Report(path, (i + 1) / (float)controllerGuids.Length);
 
-                        if (filter != null && !filter.Contains(path))
+                        if (!PassesAssetFilter(path, filter))
                             continue;
 
                         var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(path);
@@ -659,6 +669,26 @@ namespace PackageSaveTool
             }
 
             return allReports;
+        }
+
+        private static bool PassesAssetFilter(string assetPath, HashSet<string> filter)
+        {
+            if (filter == null)
+                return true;
+            if (filter.Contains(assetPath))
+                return true;
+
+            foreach (var entry in filter)
+            {
+                if (string.IsNullOrEmpty(entry))
+                    continue;
+
+                string prefix = entry.TrimEnd('/') + "/";
+                if (assetPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
         }
         #endregion
     }

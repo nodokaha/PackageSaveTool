@@ -45,6 +45,49 @@ namespace PackageSaveTool
             return ComparePairs(pairs, includeDeletes);
         }
 
+        /// <summary>
+        /// マニフェストの1エントリ（ファイルまたはフォルダ）を、比較可能なファイル単位のペアに展開する。
+        /// フォルダパスのまま File.Exists すると差分0件になり、確認なしで上書きされてしまう。
+        /// </summary>
+        public static void AddExpandedPairs(
+            List<DiffFilePair> pairs,
+            string relativePath,
+            string sourcePath,
+            string destinationPath,
+            string skipFileName)
+        {
+            if (pairs == null || string.IsNullOrEmpty(relativePath))
+                return;
+
+            bool sourceIsDir = !string.IsNullOrEmpty(sourcePath) && Directory.Exists(sourcePath);
+            bool destIsDir = !string.IsNullOrEmpty(destinationPath) && Directory.Exists(destinationPath);
+
+            if (!sourceIsDir && !destIsDir)
+            {
+                if (!IsSkippedFileName(relativePath, skipFileName))
+                    pairs.Add(new DiffFilePair(relativePath, sourcePath, destinationPath));
+                return;
+            }
+
+            var sourceFiles = sourceIsDir ? MapByRelativePath(sourcePath) : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var destFiles = destIsDir ? MapByRelativePath(destinationPath) : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string prefix = PathUtil.NormalizeSlashes(relativePath).TrimEnd('/');
+
+            foreach (var childRel in sourceFiles.Keys.Union(destFiles.Keys, StringComparer.OrdinalIgnoreCase))
+            {
+                string combinedRel = string.IsNullOrEmpty(prefix)
+                    ? PathUtil.NormalizeSlashes(childRel)
+                    : prefix + "/" + PathUtil.NormalizeSlashes(childRel);
+
+                if (IsSkippedFileName(combinedRel, skipFileName))
+                    continue;
+
+                sourceFiles.TryGetValue(childRel, out string src);
+                destFiles.TryGetValue(childRel, out string dst);
+                pairs.Add(new DiffFilePair(combinedRel, src, dst));
+            }
+        }
+
         public static DetailedFolderDiffInfo ComparePairs(IEnumerable<DiffFilePair> pairs, bool includeDeletes)
         {
             var result = new DetailedFolderDiffInfo();
@@ -148,6 +191,14 @@ namespace PackageSaveTool
             return Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories)
                 .Where(f => !f.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
                 .ToList();
+        }
+
+        private static bool IsSkippedFileName(string relativePath, string skipFileName)
+        {
+            if (string.IsNullOrEmpty(skipFileName) || string.IsNullOrEmpty(relativePath))
+                return false;
+
+            return string.Equals(Path.GetFileName(relativePath), skipFileName, StringComparison.OrdinalIgnoreCase);
         }
 
         private static Dictionary<string, string> MapByRelativePath(string folderPath)

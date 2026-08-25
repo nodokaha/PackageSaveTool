@@ -57,8 +57,9 @@ namespace PackageSaveTool
                 var selectedPaths = treeView.GetSelectedPaths();
                 if (selectedPaths.Count > 0)
                 {
-                    onFoldersSelected?.Invoke(selectedPaths);
+                    var callback = onFoldersSelected;
                     Close();
+                    EditorApplication.delayCall += () => callback?.Invoke(selectedPaths);
                 }
                 else
                 {
